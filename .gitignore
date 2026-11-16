@@ -1,0 +1,4 @@
+local.settings.json
+ios-mcp-server
+/bin/
+.worktrees
