@@ -27,10 +27,13 @@ type Instance struct {
 	// (the original, as-scheduled start time of the slot — RFC 5545's
 	// RECURRENCE-ID). Nil for a non-recurring event.
 	RecurrenceID *time.Time
-	// TZIDFallback is set to the raw TZID when one of this event's
-	// date-times carried a TZID that couldn't be resolved to a real time
-	// zone and was interpreted in the default location instead (see
-	// resolveTZID), so Start/End may be wrong. Empty normally.
+	// TZIDFallback is set to the raw TZID when one of the date-times this
+	// instance's Start/End/RecurrenceID come from (DTSTART, DTEND,
+	// RECURRENCE-ID, or the RDATE that added it) carried a TZID that
+	// couldn't be resolved to a real time zone and was interpreted in the
+	// default location instead (see zones.location), so Start/End may be
+	// wrong. Empty normally; never set because of an EXDATE (see
+	// Expansion.ExclusionFallbackTZIDs).
 	TZIDFallback string
 }
 
@@ -50,27 +53,46 @@ type Expansion struct {
 	// one calendar object should hold exactly one such VEVENT (RFC 4791
 	// section 4.1), so only the first is used.
 	IgnoredMasters int
-	// FallbackTZIDs lists, once each, TZIDs in the object that are neither
-	// IANA names nor known Windows zone IDs, and were therefore interpreted
-	// in the default location (see resolveTZID). Times in affected
-	// instances may be wrong; each such Instance has TZIDFallback set.
+	// FallbackTZIDs lists, once each, TZIDs on properties that determine
+	// instances' times (DTSTART, DTEND, RECURRENCE-ID, RDATE) that are
+	// neither IANA names, nor defined by a VTIMEZONE in the object that
+	// could be interpreted, nor known Windows zone IDs, and were therefore
+	// interpreted in the default location (see zones.location). Times in
+	// affected instances may be wrong; each such Instance has TZIDFallback
+	// set.
 	FallbackTZIDs []string
+	// ExclusionFallbackTZIDs is FallbackTZIDs for EXDATE properties. An
+	// EXDATE only removes occurrences, never sets a displayed time, so no
+	// Instance is flagged for it; but a guessed EXDATE time may fail to
+	// match the occurrence it was meant to remove, leaving a deleted
+	// occurrence listed. Callers should log it.
+	ExclusionFallbackTZIDs []string
 }
 
-// window is the half-open time range [start, end) instances must overlap,
-// or, if unbounded, no restriction at all (see SingleEvent).
+// window selects which instances an expansion returns: those overlapping
+// the half-open time range [start, end); or, if unbounded, every instance
+// regardless of time (see SingleEvent); or, if slot is set, only the
+// occurrence of a recurring series whose RECURRENCE-ID is *slot, wherever
+// in time it now falls (see Occurrence).
 type window struct {
 	start, end time.Time
 	unbounded  bool
+	slot       *time.Time
 }
 
 func (w window) includes(start, end time.Time) bool {
-	return w.unbounded || overlaps(start, end, w.start, w.end)
+	return w.unbounded || w.slot != nil || overlaps(start, end, w.start, w.end)
+}
+
+// inSlot reports whether the occurrence keyed by key (its RECURRENCE-ID's
+// Unix time) is one this window can return.
+func (w window) inSlot(key int64) bool {
+	return w.slot == nil || w.slot.UTC().Unix() == key
 }
 
 // ExpandEvents is Expand, returning only the instances.
-func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowStart, windowEnd time.Time, loc *time.Location) ([]Instance, error) {
-	x, err := Expand(calendarPath, objectPath, events, windowStart, windowEnd, loc)
+func ExpandEvents(calendarPath, objectPath string, events []ical.Event, timezones []*ical.Component, windowStart, windowEnd time.Time, loc *time.Location) ([]Instance, error) {
+	x, err := Expand(calendarPath, objectPath, events, timezones, windowStart, windowEnd, loc)
 	return x.Instances, err
 }
 
@@ -80,6 +102,10 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 // concrete Instances overlapping the half-open window [windowStart,
 // windowEnd), along with diagnostics about anything it had to guess at or
 // ignore.
+//
+// timezones are the object's VTIMEZONE components (see Timezones), used to
+// resolve TZIDs that aren't IANA names; loc is the default zone for
+// floating times and for TZIDs nothing can resolve.
 //
 // Recurrence (RRULE/EXDATE, and RECURRENCE-ID overrides) is expanded here,
 // in server code, deliberately: iCloud's server-side expansion
@@ -91,38 +117,56 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 // unparseable date); callers listing many objects should skip it and carry
 // on rather than fail the whole listing. Known real-world quirks are
 // tolerated rather than treated as errors: multi-value EXDATE/RDATE
-// properties, and TZIDs that aren't IANA names (see resolveTZID).
-func Expand(calendarPath, objectPath string, events []ical.Event, windowStart, windowEnd time.Time, loc *time.Location) (Expansion, error) {
-	return expand(calendarPath, objectPath, events, window{start: windowStart, end: windowEnd}, loc)
+// properties, and TZIDs that aren't IANA names (see zones.location).
+func Expand(calendarPath, objectPath string, events []ical.Event, timezones []*ical.Component, windowStart, windowEnd time.Time, loc *time.Location) (Expansion, error) {
+	return expand(calendarPath, objectPath, events, timezones, window{start: windowStart, end: windowEnd}, loc)
 }
 
 // SingleEvent is Expand with no time window, for looking up a known
 // non-recurring event wherever in time it falls: the object's non-recurring
 // VEVENT (unless cancelled) is returned regardless of its date. A recurring
 // series has unboundedly many occurrences, so for one only standalone
-// overrides with no master are returned; expand a series with Expand.
-func SingleEvent(calendarPath, objectPath string, events []ical.Event, loc *time.Location) (Expansion, error) {
-	return expand(calendarPath, objectPath, events, window{unbounded: true}, loc)
+// overrides with no master are returned; look up one occurrence of a series
+// with Occurrence.
+func SingleEvent(calendarPath, objectPath string, events []ical.Event, timezones []*ical.Component, loc *time.Location) (Expansion, error) {
+	return expand(calendarPath, objectPath, events, timezones, window{unbounded: true}, loc)
 }
 
-func expand(calendarPath, objectPath string, events []ical.Event, win window, loc *time.Location) (Expansion, error) {
+// Occurrence is Expand for looking up one known occurrence of a recurring
+// series by its RECURRENCE-ID (its original, as-scheduled start): it
+// returns that occurrence if the series has it — the RECURRENCE-ID override
+// for that slot wherever in time the override moved it, else the rule's
+// own occurrence at that slot unless it's excluded — and nothing otherwise.
+func Occurrence(calendarPath, objectPath string, events []ical.Event, timezones []*ical.Component, recurrenceID time.Time, loc *time.Location) (Expansion, error) {
+	return expand(calendarPath, objectPath, events, timezones, window{slot: &recurrenceID}, loc)
+}
+
+// Date-time properties, grouped by what a TZID guessed at on them affects
+// (see Expansion.FallbackTZIDs and ExclusionFallbackTZIDs). RDATE is in
+// neither per-event list: only the occurrences it adds are affected, and
+// those are flagged individually (see recurrenceSet).
+var (
+	instanceTimeProps  = []string{ical.PropDateTimeStart, ical.PropDateTimeEnd, ical.PropRecurrenceID}
+	instanceTZIDProps  = []string{ical.PropDateTimeStart, ical.PropDateTimeEnd, ical.PropRecurrenceID, ical.PropRecurrenceDates}
+	exclusionTZIDProps = []string{ical.PropExceptionDates}
+)
+
+func expand(calendarPath, objectPath string, events []ical.Event, timezones []*ical.Component, win window, loc *time.Location) (Expansion, error) {
 	var x Expansion
 	if len(events) == 0 {
 		return x, nil
 	}
 
-	x.FallbackTZIDs = fallbackTZIDs(events)
+	z := newZones(loc, timezones)
+	x.FallbackTZIDs = z.guessedTZIDs(events, instanceTZIDProps)
+	x.ExclusionFallbackTZIDs = z.guessedTZIDs(events, exclusionTZIDProps)
 
 	var master *ical.Event
-	overridesByKey := map[int64]overrideEntry{}
+	var overrides []*ical.Event
 	for i := range events {
 		e := &events[i]
-		if prop := e.Props.Get(ical.PropRecurrenceID); prop != nil {
-			rid, err := propDateTime(prop, loc)
-			if err != nil {
-				return Expansion{}, fmt.Errorf("icloud: parsing RECURRENCE-ID: %w", err)
-			}
-			overridesByKey[rid.UTC().Unix()] = overrideEntry{recurrenceID: rid, event: e}
+		if e.Props.Get(ical.PropRecurrenceID) != nil {
+			overrides = append(overrides, e)
 		} else if master == nil {
 			master = e
 		} else {
@@ -130,12 +174,45 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 		}
 	}
 
+	// The organizer cancelled the event, or the entire series. Checked
+	// before anything else about the master is parsed, so a cancelled
+	// series is dropped even if its RRULE (say) wouldn't parse.
+	if master != nil && isCancelled(master) {
+		return x, nil
+	}
+
+	var masterStart time.Time
+	// A RECURRENCE-ID without a TZID of its own names a slot of the
+	// master's series, so it's read in the master's DTSTART zone, like
+	// EXDATE/RDATE (see recurrenceSet).
+	ridFloating := z.fallback
+	if master != nil {
+		var err error
+		masterStart, err = z.eventStart(master)
+		if err != nil {
+			return Expansion{}, fmt.Errorf("icloud: parsing master DTSTART: %w", err)
+		}
+		ridFloating = masterStart.Location()
+	}
+
+	overridesByKey := map[int64]overrideEntry{}
+	for _, e := range overrides {
+		rid, err := z.dateTime(e.Props.Get(ical.PropRecurrenceID), ridFloating)
+		if err != nil {
+			return Expansion{}, fmt.Errorf("icloud: parsing RECURRENCE-ID: %w", err)
+		}
+		overridesByKey[rid.UTC().Unix()] = overrideEntry{recurrenceID: rid, event: e}
+	}
+
 	if master == nil {
 		// Every VEVENT here is an override with no master in sight (e.g. the
 		// master was deleted but an exception survived server-side). Treat
 		// each override as its own standalone instance.
-		for _, entry := range overridesByKey {
-			inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, entry.recurrenceID, win, loc)
+		for key, entry := range overridesByKey {
+			if !win.inSlot(key) {
+				continue
+			}
+			inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, entry.recurrenceID, win, z)
 			if err != nil {
 				return Expansion{}, err
 			}
@@ -147,26 +224,17 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 		return x, nil
 	}
 
-	// The organizer cancelled the event, or the entire series. Checked
-	// before anything else about the master is parsed, so a cancelled
-	// series is dropped even if its RRULE (say) wouldn't parse.
-	if isCancelled(master) {
-		return x, nil
-	}
-
-	masterStart, err := eventStart(master, loc)
-	if err != nil {
-		return Expansion{}, fmt.Errorf("icloud: parsing master DTSTART: %w", err)
-	}
-
-	ruleSet, err := recurrenceSet(master, masterStart, loc)
+	ruleSet, guessedRDates, err := recurrenceSet(master, masterStart, z)
 	if err != nil {
 		return Expansion{}, fmt.Errorf("icloud: parsing recurrence rule: %w", err)
 	}
 
 	if ruleSet == nil {
-		// Not a recurring series: a single instance.
-		inst, err := instanceFromEvent(calendarPath, objectPath, master, nil, loc)
+		// Not a recurring series: a single instance, which has no slots.
+		if win.slot != nil {
+			return x, nil
+		}
+		inst, err := instanceFromEvent(calendarPath, objectPath, master, nil, z)
 		if err != nil {
 			return Expansion{}, err
 		}
@@ -181,7 +249,7 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 		return x, nil
 	}
 
-	masterEnd, err := eventEnd(master, masterStart, loc)
+	masterEnd, err := z.eventEnd(master, masterStart)
 	if err != nil {
 		return Expansion{}, fmt.Errorf("icloud: parsing master DTEND: %w", err)
 	}
@@ -201,21 +269,32 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 	masterTitle := textProp(master, ical.PropSummary)
 	masterLocation := textProp(master, ical.PropLocation)
 	masterNotes := textProp(master, ical.PropDescription)
-	masterTZIDFallback := eventFallbackTZID(master)
+	// Only the properties that set an occurrence's displayed time: a guessed
+	// EXDATE TZID doesn't make every occurrence's Start/End suspect.
+	masterTZIDFallback := z.eventGuessedTZID(master, instanceTimeProps)
 
-	// Between matches on occurrence *start*, so reach back by the event's
-	// own length too: an occurrence that started before the window but is
-	// still running inside it must be generated to be considered at all.
-	occurrences := ruleSet.Between(win.start.Add(-(expansionPad + duration)), win.end.Add(expansionPad), true)
+	var occurrences []time.Time
+	if win.slot != nil {
+		occurrences = ruleSet.Between(*win.slot, *win.slot, true)
+	} else {
+		// Between matches on occurrence *start*, so reach back by the
+		// event's own length too: an occurrence that started before the
+		// window but is still running inside it must be generated to be
+		// considered at all.
+		occurrences = ruleSet.Between(win.start.Add(-(expansionPad + duration)), win.end.Add(expansionPad), true)
+	}
 
 	consumed := map[int64]bool{}
 	for _, occStart := range occurrences {
 		key := occStart.UTC().Unix()
+		if !win.inSlot(key) {
+			continue
+		}
 		rid := occStart
 
 		if entry, ok := overridesByKey[key]; ok {
 			consumed[key] = true
-			inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, rid, win, loc)
+			inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, rid, win, z)
 			if err != nil {
 				return Expansion{}, err
 			}
@@ -228,6 +307,10 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 		start := occStart
 		end := occurrenceEnd(occStart)
 		if win.includes(start, end) {
+			tzidFallback := masterTZIDFallback
+			if tzidFallback == "" {
+				tzidFallback = guessedRDates[key]
+			}
 			x.Instances = append(x.Instances, Instance{
 				UID:          masterUID,
 				ObjectPath:   objectPath,
@@ -240,7 +323,7 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 				Notes:        masterNotes,
 				Recurring:    true,
 				RecurrenceID: &rid,
-				TZIDFallback: masterTZIDFallback,
+				TZIDFallback: tzidFallback,
 			})
 		}
 	}
@@ -250,10 +333,10 @@ func expand(calendarPath, objectPath string, events []ical.Event, win window, lo
 	// slot falls well outside [windowStart, windowEnd)) still needs
 	// consideration using its own, possibly-moved start time.
 	for key, entry := range overridesByKey {
-		if consumed[key] {
+		if consumed[key] || !win.inSlot(key) {
 			continue
 		}
-		inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, entry.recurrenceID, win, loc)
+		inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, entry.recurrenceID, win, z)
 		if err != nil {
 			return Expansion{}, err
 		}
@@ -275,23 +358,25 @@ type overrideEntry struct {
 
 // overrideInstance turns a RECURRENCE-ID override VEVENT into the Instance
 // for slot rid, reporting false if it was cancelled or falls outside win.
-func overrideInstance(calendarPath, objectPath string, e *ical.Event, rid time.Time, win window, loc *time.Location) (Instance, bool, error) {
+// (A slot window includes it wherever it moved: it was matched by its
+// RECURRENCE-ID, which is what identifies it.)
+func overrideInstance(calendarPath, objectPath string, e *ical.Event, rid time.Time, win window, z *zones) (Instance, bool, error) {
 	if isCancelled(e) {
 		return Instance{}, false, nil // this occurrence was deleted from the series
 	}
-	inst, err := instanceFromEvent(calendarPath, objectPath, e, &rid, loc)
+	inst, err := instanceFromEvent(calendarPath, objectPath, e, &rid, z)
 	if err != nil {
 		return Instance{}, false, err
 	}
 	return inst, win.includes(inst.Start, inst.End), nil
 }
 
-func instanceFromEvent(calendarPath, objectPath string, e *ical.Event, recurrenceID *time.Time, loc *time.Location) (Instance, error) {
-	start, err := eventStart(e, loc)
+func instanceFromEvent(calendarPath, objectPath string, e *ical.Event, recurrenceID *time.Time, z *zones) (Instance, error) {
+	start, err := z.eventStart(e)
 	if err != nil {
 		return Instance{}, fmt.Errorf("icloud: parsing DTSTART: %w", err)
 	}
-	end, err := eventEnd(e, start, loc)
+	end, err := z.eventEnd(e, start)
 	if err != nil {
 		return Instance{}, fmt.Errorf("icloud: parsing DTEND: %w", err)
 	}
@@ -307,12 +392,14 @@ func instanceFromEvent(calendarPath, objectPath string, e *ical.Event, recurrenc
 		Notes:        textProp(e, ical.PropDescription),
 		Recurring:    recurrenceID != nil,
 		RecurrenceID: recurrenceID,
-		TZIDFallback: eventFallbackTZID(e),
+		TZIDFallback: z.eventGuessedTZID(e, instanceTimeProps),
 	}, nil
 }
 
 // recurrenceSet builds the rrule.Set for a recurring master, or returns nil
-// if it has no RRULE.
+// if it has no RRULE. guessedRDates maps (by Unix time) each RDATE whose
+// TZID could only be guessed at to that TZID, so the occurrences it adds
+// can be flagged.
 //
 // This replaces go-ical's Component.RecurrenceSet, which (a) parses the
 // RRULE via rrule.StrToROption, reading a DATE or floating UNTIL as UTC
@@ -321,17 +408,24 @@ func instanceFromEvent(calendarPath, objectPath string, e *ical.Event, recurrenc
 // RDATE property as a single timestamp, failing on RFC 5545's
 // comma-separated multi-value form. Otherwise it assembles the set the same
 // way (RRULE + DTSTART, then every EXDATE and RDATE).
-func recurrenceSet(e *ical.Event, dtstart time.Time, loc *time.Location) (*rrule.Set, error) {
+//
+// EXDATE/RDATE values without a TZID of their own are read in DTSTART's
+// zone, as the RRULE is: they name slots of this series (RFC 5545 wants
+// them to match DTSTART's form), and exclusion is an exact-instant match,
+// so reading a bare EXDATE in the server's default zone instead would
+// silently fail to exclude anything whenever the series' zone differs.
+func recurrenceSet(e *ical.Event, dtstart time.Time, z *zones) (set *rrule.Set, guessedRDates map[int64]string, err error) {
 	prop := e.Props.Get(ical.PropRecurrenceRule)
 	if prop == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
+	seriesLoc := dtstart.Location()
 
-	opt, err := rrule.StrToROptionInLocation(prop.Value, dtstart.Location())
+	opt, err := rrule.StrToROptionInLocation(prop.Value, seriesLoc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if until, ok := rruleUntilDate(prop.Value, dtstart.Location()); ok {
+	if until, ok := rruleUntilDate(prop.Value, seriesLoc); ok {
 		// RFC 5545: a DATE-valued UNTIL includes that whole day.
 		opt.Until = until.AddDate(0, 0, 1).Add(-time.Second)
 	}
@@ -339,18 +433,18 @@ func recurrenceSet(e *ical.Event, dtstart time.Time, loc *time.Location) (*rrule
 
 	rule, err := rrule.NewRRule(*opt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	set := &rrule.Set{}
+	set = &rrule.Set{}
 	set.RRule(rule)
 	set.DTStart(dtstart)
 
 	exdates := e.Props.Values(ical.PropExceptionDates)
 	for i := range exdates {
-		times, err := propDateTimes(&exdates[i], loc)
+		times, err := z.dateTimes(&exdates[i], seriesLoc)
 		if err != nil {
-			return nil, fmt.Errorf("parsing EXDATE: %w", err)
+			return nil, nil, fmt.Errorf("parsing EXDATE: %w", err)
 		}
 		for _, t := range times {
 			set.ExDate(t)
@@ -358,15 +452,23 @@ func recurrenceSet(e *ical.Event, dtstart time.Time, loc *time.Location) (*rrule
 	}
 	rdates := e.Props.Values(ical.PropRecurrenceDates)
 	for i := range rdates {
-		times, err := propDateTimes(&rdates[i], loc)
+		times, err := z.dateTimes(&rdates[i], seriesLoc)
 		if err != nil {
-			return nil, fmt.Errorf("parsing RDATE: %w", err)
+			return nil, nil, fmt.Errorf("parsing RDATE: %w", err)
 		}
+		tzid := rdates[i].Params.Get(ical.PropTimezoneID)
+		guessed := z.guesses(tzid)
 		for _, t := range times {
 			set.RDate(t)
+			if guessed {
+				if guessedRDates == nil {
+					guessedRDates = map[int64]string{}
+				}
+				guessedRDates[t.UTC().Unix()] = tzid
+			}
 		}
 	}
-	return set, nil
+	return set, guessedRDates, nil
 }
 
 // rruleUntilDate returns the UNTIL part of an RRULE value parsed as a
@@ -387,23 +489,23 @@ func rruleUntilDate(rruleValue string, loc *time.Location) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// eventStart returns the event's DTSTART (see propDateTime).
-func eventStart(e *ical.Event, loc *time.Location) (time.Time, error) {
+// eventStart returns the event's DTSTART (see zones.dateTime).
+func (z *zones) eventStart(e *ical.Event) (time.Time, error) {
 	prop := e.Props.Get(ical.PropDateTimeStart)
 	if prop == nil {
 		return time.Time{}, fmt.Errorf("missing DTSTART")
 	}
-	return propDateTime(prop, loc)
+	return z.dateTime(prop, z.fallback)
 }
 
 // eventEnd returns the event's non-inclusive end, mirroring go-ical's
 // Event.DateTimeEnd (DTEND, else DTSTART+DURATION, else DTSTART plus one
 // day for a DATE DTSTART or zero for a DATE-TIME one, per RFC 5545 section
-// 3.6.1), but with propDateTime's tolerant parsing, and with the implied
+// 3.6.1), but with zones.dateTime's tolerant parsing, and with the implied
 // all-day length as one calendar day rather than 24h.
-func eventEnd(e *ical.Event, start time.Time, loc *time.Location) (time.Time, error) {
+func (z *zones) eventEnd(e *ical.Event, start time.Time) (time.Time, error) {
 	if prop := e.Props.Get(ical.PropDateTimeEnd); prop != nil {
-		return propDateTime(prop, loc)
+		return z.dateTime(prop, z.fallback)
 	}
 	if prop := e.Props.Get(ical.PropDuration); prop != nil {
 		dur, err := prop.Duration()
@@ -418,18 +520,19 @@ func eventEnd(e *ical.Event, start time.Time, loc *time.Location) (time.Time, er
 	return start, nil
 }
 
-// propDateTime parses a single DATE or DATE-TIME property value like
-// go-ical's Prop.DateTime, except that a TZID which isn't an IANA name is
-// resolved via resolveTZID instead of failing.
-func propDateTime(prop *ical.Prop, loc *time.Location) (time.Time, error) {
+// dateTime parses a single DATE or DATE-TIME property value like go-ical's
+// Prop.DateTime, reading a value with no TZID (a floating time or a DATE)
+// in floating, except that a TZID which isn't an IANA name is resolved via
+// zones.location instead of failing.
+func (z *zones) dateTime(prop *ical.Prop, floating *time.Location) (time.Time, error) {
 	tzid := prop.Params.Get(ical.PropTimezoneID)
 	if tzid == "" {
-		return prop.DateTime(loc)
+		return prop.DateTime(floating)
 	}
 	if _, err := time.LoadLocation(tzid); err == nil {
-		return prop.DateTime(loc)
+		return prop.DateTime(floating)
 	}
-	// Re-parse without the unrecognised TZID, in its best-guess location.
+	// Re-parse without the unrecognised TZID, in its resolved location.
 	// Copy Params so the caller's property isn't modified.
 	stripped := *prop
 	stripped.Params = make(ical.Params, len(prop.Params))
@@ -437,13 +540,14 @@ func propDateTime(prop *ical.Prop, loc *time.Location) (time.Time, error) {
 		stripped.Params[k] = v
 	}
 	stripped.Params.Del(ical.PropTimezoneID)
-	return stripped.DateTime(resolveTZID(tzid, loc))
+	loc, _ := z.location(tzid)
+	return stripped.DateTime(loc)
 }
 
-// propDateTimes parses an EXDATE/RDATE property, whose value may be a
+// dateTimes parses an EXDATE/RDATE property, whose value may be a
 // comma-separated list of DATE or DATE-TIME values (RFC 5545 sections
 // 3.8.5.1 and 3.8.5.2). An RDATE PERIOD value contributes its start.
-func propDateTimes(prop *ical.Prop, loc *time.Location) ([]time.Time, error) {
+func (z *zones) dateTimes(prop *ical.Prop, floating *time.Location) ([]time.Time, error) {
 	var out []time.Time
 	for _, value := range strings.Split(prop.Value, ",") {
 		value = strings.TrimSpace(value)
@@ -462,7 +566,7 @@ func propDateTimes(prop *ical.Prop, loc *time.Location) ([]time.Time, error) {
 			}
 			single.Params.Del(ical.ParamValue)
 		}
-		t, err := propDateTime(&single, loc)
+		t, err := z.dateTime(&single, floating)
 		if err != nil {
 			return nil, err
 		}
@@ -473,7 +577,8 @@ func propDateTimes(prop *ical.Prop, loc *time.Location) ([]time.Time, error) {
 
 // windowsZones maps the Windows time zone IDs most often seen as TZIDs in
 // invites from Exchange/Outlook to IANA names. Go's time.LoadLocation only
-// knows IANA names, and go-ical never consults a calendar's VTIMEZONE.
+// knows IANA names, and such invites' VTIMEZONEs are often too intricate
+// for vtimezoneLocation.
 var windowsZones = map[string]string{
 	"Eastern Standard Time":          "America/New_York",
 	"Central Standard Time":          "America/Chicago",
@@ -502,23 +607,6 @@ var windowsZones = map[string]string{
 	"UTC":                            "UTC",
 }
 
-// resolveTZID maps a TZID that time.LoadLocation doesn't recognise to a
-// location: a known Windows zone ID's IANA equivalent, else fallback (the
-// server's configured default zone). The fallback keeps one oddly-labelled
-// event from breaking a listing; a structurally valid local time in the
-// user's own zone is the most likely intent for an unknown label. It is a
-// guess, though, so it's reported: see Expansion.FallbackTZIDs and
-// Instance.TZIDFallback.
-func resolveTZID(tzid string, fallback *time.Location) *time.Location {
-	if loc, ok := windowsZone(tzid); ok {
-		return loc
-	}
-	if fallback == nil {
-		return time.UTC
-	}
-	return fallback
-}
-
 func windowsZone(tzid string) (*time.Location, bool) {
 	name := strings.Trim(strings.TrimSpace(tzid), `"`)
 	if iana, ok := windowsZones[name]; ok {
@@ -529,34 +617,12 @@ func windowsZone(tzid string) (*time.Location, bool) {
 	return nil, false
 }
 
-// tzidFallsBack reports whether propDateTime would interpret a date-time
-// with this TZID in the fallback location, i.e. resolveTZID had to guess.
-func tzidFallsBack(tzid string) bool {
-	if tzid == "" {
-		return false
-	}
-	if _, err := time.LoadLocation(tzid); err == nil {
-		return false
-	}
-	_, ok := windowsZone(tzid)
-	return !ok
-}
-
-// dateTimeProps are the VEVENT properties propDateTime interprets.
-var dateTimeProps = []string{
-	ical.PropDateTimeStart,
-	ical.PropDateTimeEnd,
-	ical.PropRecurrenceID,
-	ical.PropExceptionDates,
-	ical.PropRecurrenceDates,
-}
-
-// eventFallbackTZID returns the first TZID among e's date-time properties
-// that resolveTZID can only guess at, or "".
-func eventFallbackTZID(e *ical.Event) string {
-	for _, name := range dateTimeProps {
+// eventGuessedTZID returns the first TZID on e's props (named in props)
+// that zones can only guess at, or "".
+func (z *zones) eventGuessedTZID(e *ical.Event, props []string) string {
+	for _, name := range props {
 		for _, prop := range e.Props.Values(name) {
-			if tzid := prop.Params.Get(ical.PropTimezoneID); tzidFallsBack(tzid) {
+			if tzid := prop.Params.Get(ical.PropTimezoneID); z.guesses(tzid) {
 				return tzid
 			}
 		}
@@ -564,16 +630,16 @@ func eventFallbackTZID(e *ical.Event) string {
 	return ""
 }
 
-// fallbackTZIDs returns, once each, every TZID in events that resolveTZID
-// can only guess at.
-func fallbackTZIDs(events []ical.Event) []string {
+// guessedTZIDs returns, once each, every TZID on events' props (named in
+// props) that zones can only guess at.
+func (z *zones) guessedTZIDs(events []ical.Event, props []string) []string {
 	var out []string
 	seen := map[string]bool{}
 	for i := range events {
-		for _, name := range dateTimeProps {
+		for _, name := range props {
 			for _, prop := range events[i].Props.Values(name) {
 				tzid := prop.Params.Get(ical.PropTimezoneID)
-				if tzidFallsBack(tzid) && !seen[tzid] {
+				if z.guesses(tzid) && !seen[tzid] {
 					seen[tzid] = true
 					out = append(out, tzid)
 				}

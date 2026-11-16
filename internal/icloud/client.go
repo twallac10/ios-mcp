@@ -42,12 +42,23 @@ type Client struct {
 
 	// homeSet caches the account's calendar-home-set href, found via two
 	// discovery round trips (current-user-principal, then
-	// calendar-home-set) that give the same answer for the life of the
-	// account — so a warm Function instance doesn't repeat them on every
-	// MCP tool call, mirroring credentials.Store's cache.
-	mu      sync.Mutex
-	homeSet string
+	// calendar-home-set) that almost always give the same answer — so a
+	// warm Function instance doesn't repeat them on every MCP tool call,
+	// mirroring credentials.Store's cache. It's dropped on a failed calendar
+	// listing, and in any case after homeSetTTL (see calendarHomeSet).
+	mu        sync.Mutex
+	homeSet   string
+	homeSetAt time.Time
+	now       func() time.Time
 }
+
+// homeSetTTL bounds how long a discovered calendar-home-set href is
+// trusted. If the account's home set moves (e.g. an iCloud-side migration)
+// while the old href still answers successfully — with an empty or stale
+// calendar list rather than an error — nothing else would ever invalidate
+// the cache, and one Client lives as long as its credentials do. An hour
+// costs two extra PROPFINDs per hour of warm-instance uptime.
+const homeSetTTL = time.Hour
 
 // ErrUnauthorized is returned (wrapped) by every Client method when iCloud
 // answers a request with HTTP 401, i.e. it rejected the Apple ID /
@@ -94,15 +105,15 @@ func newClient(httpClient webdav.HTTPClient, endpoint, appleID, appSpecificPassw
 	if err != nil {
 		return nil, fmt.Errorf("icloud: creating CalDAV client: %w", err)
 	}
-	return &Client{dav: dav}, nil
+	return &Client{dav: dav, now: time.Now}, nil
 }
 
 // ListCalendars returns every calendar in the account's calendar home set,
 // unfiltered — callers apply the configured allowlist themselves.
 //
-// The home set's location is discovered once per Client and cached; the
-// calendar list itself is re-fetched on every call (one round trip), since
-// the user may add or remove calendars at any time.
+// The home set's location is discovered once per Client and cached (for up
+// to homeSetTTL); the calendar list itself is re-fetched on every call (one
+// round trip), since the user may add or remove calendars at any time.
 func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 	homeSet, err := c.calendarHomeSet(ctx)
 	if err != nil {
@@ -125,12 +136,13 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 }
 
 // calendarHomeSet returns the cached calendar-home-set href, discovering
-// and caching it first if needed. Only success is cached.
+// and caching it first if there is none or it's older than homeSetTTL.
+// Only success is cached.
 func (c *Client) calendarHomeSet(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.homeSet != "" {
+	if c.homeSet != "" && c.now().Sub(c.homeSetAt) < homeSetTTL {
 		return c.homeSet, nil
 	}
 	principal, err := c.dav.FindCurrentUserPrincipal(ctx)
@@ -141,7 +153,7 @@ func (c *Client) calendarHomeSet(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("icloud: finding calendar home set: %w", err)
 	}
-	c.homeSet = homeSet
+	c.homeSet, c.homeSetAt = homeSet, c.now()
 	return homeSet, nil
 }
 

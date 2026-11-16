@@ -273,3 +273,33 @@ func TestListCalendars_CachesDiscovery(t *testing.T) {
 		t.Errorf("calendar list fetched %d times, want 2 (it isn't cached)", fake.listCalls)
 	}
 }
+
+func TestListCalendars_RediscoversHomeSetAfterTTL(t *testing.T) {
+	fake := &discoveryCalDAV{}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	c, err := newClient(srv.Client(), srv.URL, "user@example.com", "pw")
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return now }
+
+	list := func() {
+		t.Helper()
+		if _, err := c.ListCalendars(context.Background()); err != nil {
+			t.Fatalf("ListCalendars: %v", err)
+		}
+	}
+	list()
+	now = now.Add(homeSetTTL - time.Minute)
+	list() // still cached
+	now = now.Add(2 * time.Minute)
+	list() // expired: rediscovered, even though every call succeeded
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.principalCalls != 2 || fake.homeSetCalls != 2 {
+		t.Errorf("discovery ran principal=%d home-set=%d times, want twice each (initially, then after the TTL)", fake.principalCalls, fake.homeSetCalls)
+	}
+}

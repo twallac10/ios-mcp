@@ -17,6 +17,7 @@ import (
 	ical "github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav/caldav"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/twallac10/ios-mcp/internal/config"
 	"github.com/twallac10/ios-mcp/internal/credentials"
@@ -114,15 +115,18 @@ func storeConnector[C calendarClient](store credentialSource, newClient func(app
 // Register adds every iCloud Calendar tool to s.
 func (svc *Service) Register(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "list_calendars",
-		Description: "List the iCloud calendars this server is configured to expose (see the server's calendar allowlist). Call this first to get the exact calendar names to pass to list_events and create_event.",
+		Name: "list_calendars",
+		Description: "List the iCloud calendars this server is configured to expose (see the server's calendar allowlist). Call this first to get the exact calendar names to pass to list_events and create_event. " +
+			"Each calendar also has an opaque `id`, which create_event accepts in place of the name; use the id when two calendars share a name.",
 		Annotations: readOnly,
 	}, svc.listCalendars)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_events",
 		Description: "List calendar events in a time window, with recurring events already expanded into their individual occurrences (one entry per occurrence, not one per series). " +
-			"Each returned event has an opaque `id` to pass to get_event. Times are always full RFC3339 timestamps with a UTC offset.",
+			"Each returned event has an opaque `id` to pass to get_event. Times are always full RFC3339 timestamps with a UTC offset. " +
+			"IMPORTANT: if the result's `incomplete` is true, some events could not be retrieved (e.g. one calendar failed to load; `warnings` says which), so the list is partial: " +
+			"tell the user, and don't conclude from it that a time is free or that an event doesn't exist.",
 		Annotations: readOnly,
 	}, svc.listEvents)
 
@@ -134,7 +138,7 @@ func (svc *Service) Register(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "create_event",
-		Description: "Create a single new (non-recurring) event on one of the allow-listed iCloud calendars. There is no update or delete tool in this server; to change or remove an event, do so in the Calendar app.",
+		Description: "Create a single new (non-recurring) event on one of the allow-listed iCloud calendars, given by name or by its `id` from list_calendars. There is no update or delete tool in this server; to change or remove an event, do so in the Calendar app.",
 		Annotations: writeNonDestructive,
 	}, svc.createEvent)
 }
@@ -145,12 +149,16 @@ type ListCalendarsArgs struct{}
 
 type CalendarOut struct {
 	Name string `json:"name"`
+	// ID is an opaque token for this calendar (see icloud.CalendarToken),
+	// which create_event accepts in place of Name — needed when two
+	// calendars share a name.
+	ID string `json:"id" jsonschema:"Opaque calendar id; create_event accepts it in place of the name, which is needed when two calendars share a name."`
 }
 
 type ListCalendarsResult struct {
 	Calendars []CalendarOut `json:"calendars"`
 	// Warnings notes allow-listed names shared by more than one calendar,
-	// which create_event refuses to write to.
+	// which create_event can only address by id.
 	Warnings []string `json:"warnings,omitempty"`
 }
 
@@ -168,15 +176,16 @@ func (svc *Service) listCalendars(ctx context.Context, _ *mcp.CallToolRequest, _
 	counts := map[string]int{}
 	for _, cal := range allowedCalendars(cals, svc.cfg) {
 		counts[cal.Name]++
-		if counts[cal.Name] == 1 {
-			out.Calendars = append(out.Calendars, CalendarOut{Name: cal.Name})
-		}
+		out.Calendars = append(out.Calendars, CalendarOut{Name: cal.Name, ID: icloud.CalendarToken(cal.Path)})
 	}
-	sort.Slice(out.Calendars, func(i, j int) bool { return out.Calendars[i].Name < out.Calendars[j].Name })
-	for _, c := range out.Calendars {
-		if n := counts[c.Name]; n > 1 {
+	sort.Slice(out.Calendars, func(i, j int) bool {
+		a, b := out.Calendars[i], out.Calendars[j]
+		return a.Name < b.Name || (a.Name == b.Name && a.ID < b.ID)
+	})
+	for i, c := range out.Calendars {
+		if n := counts[c.Name]; n > 1 && (i == 0 || out.Calendars[i-1].Name != c.Name) {
 			out.Warnings = append(out.Warnings, fmt.Sprintf(
-				"%d calendars are named %q; list_events includes all of them, but create_event can't tell them apart and will refuse to use that name until one is renamed", n, c.Name))
+				"%d calendars are named %q; list_events includes all of them, but create_event can't tell them apart by name, so pass the id of the one you mean instead", n, c.Name))
 		}
 	}
 
@@ -211,9 +220,29 @@ type EventOut struct {
 
 type ListEventsResult struct {
 	Events []EventOut `json:"events"`
+	// Incomplete is set whenever events may be missing from Events (a
+	// calendar couldn't be queried, or entries couldn't be parsed). It's
+	// always present, unlike Warnings, so a caller checking only for an
+	// error can't mistake a partial listing for a complete one as easily.
+	Incomplete bool `json:"incomplete" jsonschema:"True when some events could not be retrieved and may be missing from events (see warnings for which calendars). Treat the list as partial: don't conclude that a time is free or that an event doesn't exist."`
 	// Warnings notes anything left out of Events, e.g. calendar entries
 	// that couldn't be parsed. Never contains event content.
-	Warnings []string `json:"warnings,omitempty"`
+	Warnings []string `json:"warnings,omitempty" jsonschema:"What was left out of events and why (e.g. a calendar that failed to load). Non-empty means the listing is incomplete; see incomplete."`
+}
+
+// maxConcurrentCalendarFetches caps how many calendars list_events queries
+// at once: enough to overlap most of the latency for a typical account,
+// few enough not to hammer one account's iCloud quota (or get throttled)
+// when it has dozens of shared/subscribed calendars.
+const maxConcurrentCalendarFetches = 4
+
+// calInstances is one calendar's contribution to a list_events call.
+type calInstances struct {
+	name           string
+	instances      []icloud.Instance
+	skipped        int
+	ignoredMasters int
+	fetchErr       error
 }
 
 func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args ListEventsArgs) (*mcp.CallToolResult, ListEventsResult, error) {
@@ -235,86 +264,72 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 
 	svc.log.Info("list_events", "calendar", args.Calendar, "start", args.Start, "end", args.End)
 
-	type calInstances struct {
-		name           string
-		instances      []icloud.Instance
-		skipped        int
-		ignoredMasters int
-		fetchErr       error
+	// Credentials are refreshed (by withClient) only if listing the
+	// calendars themselves is rejected; a 401 on a per-calendar query is
+	// retried below for just the calendars that got one, so one rejected
+	// query doesn't redo every other calendar's successful one.
+	type listing struct {
+		client calendarClient
+		cals   []icloud.Calendar
 	}
-
-	results, err := withClient(ctx, svc, func(c calendarClient) ([]calInstances, error) {
+	l, err := withClient(ctx, svc, func(c calendarClient) (listing, error) {
 		cals, err := c.ListCalendars(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		var targets []icloud.Calendar
-		for _, cal := range allowedCalendars(cals, svc.cfg) {
-			if args.Calendar == "" || cal.Name == args.Calendar {
-				targets = append(targets, cal)
-			}
-		}
-
-		// Query the calendars concurrently: they're independent requests.
-		// Each goroutine writes only its own slot, so out keeps targets'
-		// order regardless of completion order.
-		out := make([]calInstances, len(targets))
-		var wg sync.WaitGroup
-		for i, cal := range targets {
-			wg.Go(func() {
-				ci := calInstances{name: cal.Name}
-				objs, err := c.FetchObjects(ctx, cal.Path, start, end)
-				if err != nil {
-					ci.fetchErr = err
-					out[i] = ci
-					return
-				}
-				for _, obj := range objs {
-					if obj.Data == nil {
-						continue
-					}
-					events := obj.Data.Events()
-					x, err := icloud.Expand(cal.Path, obj.Path, events, start, end, svc.cfg.DefaultLocation)
-					if err != nil {
-						// One malformed calendar object mustn't sink the whole
-						// listing. Log only identifiers, never event content.
-						svc.log.Warn("list_events: skipping unparseable calendar object",
-							"object_path", obj.Path, "uid", firstUID(events), "error", err)
-						ci.skipped++
-						continue
-					}
-					svc.logExpansionDiagnostics("list_events", obj.Path, events, x)
-					if x.IgnoredMasters > 0 {
-						ci.ignoredMasters++
-					}
-					ci.instances = append(ci.instances, x.Instances...)
-				}
-				out[i] = ci
-			})
-		}
-		wg.Wait()
-
-		// Like a malformed object, one calendar that can't be queried
-		// mustn't sink the rest — unless it's an auth failure (which
-		// withClient retries) or cancellation, or nothing could be queried.
-		failed := 0
-		for _, ci := range out {
-			if ci.fetchErr == nil {
-				continue
-			}
-			if isAuthError(ci.fetchErr) || ctx.Err() != nil {
-				return nil, fmt.Errorf("calendar %q: %w", ci.name, ci.fetchErr)
-			}
-			failed++
-		}
-		if failed > 0 && failed == len(out) {
-			return nil, fmt.Errorf("calendar %q: %w", out[0].name, out[0].fetchErr)
-		}
-		return out, nil
+		return listing{client: c, cals: cals}, err
 	})
 	if err != nil {
 		return nil, ListEventsResult{}, err
+	}
+
+	var targets []icloud.Calendar
+	for _, cal := range allowedCalendars(l.cals, svc.cfg) {
+		if args.Calendar == "" || cal.Name == args.Calendar {
+			targets = append(targets, cal)
+		}
+	}
+	if args.Calendar != "" && len(targets) == 0 {
+		// Allow-listed, but not in the account (e.g. deleted): say so, as
+		// create_event does, rather than look like a calendar with no events.
+		return nil, ListEventsResult{}, fmt.Errorf("calendar %q was not found in the iCloud account", args.Calendar)
+	}
+
+	results := make([]calInstances, len(targets))
+	every := make([]int, len(targets))
+	for i := range every {
+		every[i] = i
+	}
+	svc.fetchCalendars(ctx, l.client, targets, every, results, start, end)
+
+	var authFailed []int
+	for i, r := range results {
+		if r.fetchErr != nil && isAuthError(r.fetchErr) {
+			authFailed = append(authFailed, i)
+		}
+	}
+	if len(authFailed) > 0 && ctx.Err() == nil {
+		svc.log.Info("iCloud rejected cached credentials for some calendars, retrying only those once after refetch",
+			"calendars", len(authFailed), "calendars_total", len(targets))
+		c, err := svc.connect(ctx, true)
+		if err != nil {
+			return nil, ListEventsResult{}, fmt.Errorf("reconnecting after iCloud rejected credentials: %w", err)
+		}
+		svc.fetchCalendars(ctx, c, targets, authFailed, results, start, end)
+	}
+
+	// Like a malformed object, one calendar that can't be queried mustn't
+	// sink the rest — unless it's (still) an auth failure, or cancellation,
+	// or nothing could be queried.
+	failed := 0
+	for _, ci := range results {
+		if ci.fetchErr == nil {
+			continue
+		}
+		if isAuthError(ci.fetchErr) || ctx.Err() != nil {
+			return nil, ListEventsResult{}, fmt.Errorf("calendar %q: %w", ci.name, ci.fetchErr)
+		}
+		failed++
+	}
+	if failed > 0 && failed == len(results) {
+		return nil, ListEventsResult{}, fmt.Errorf("calendar %q: %w", results[0].name, results[0].fetchErr)
 	}
 
 	type namedInstance struct {
@@ -328,6 +343,7 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 		if cr.fetchErr != nil {
 			svc.log.Warn("list_events: skipping calendar that could not be queried", "calendar", cr.name, "error", cr.fetchErr)
 			out.Warnings = append(out.Warnings, fmt.Sprintf("calendar %q could not be queried, so its events are omitted", cr.name))
+			out.Incomplete = true
 			continue
 		}
 		for _, inst := range cr.instances {
@@ -335,10 +351,12 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 		}
 		if cr.skipped > 0 {
 			skipped += cr.skipped
+			out.Incomplete = true
 			out.Warnings = append(out.Warnings, fmt.Sprintf("%d %s in calendar %q could not be parsed and %s omitted",
 				cr.skipped, plural(cr.skipped, "entry", "entries"), cr.name, plural(cr.skipped, "was", "were")))
 		}
 		if cr.ignoredMasters > 0 {
+			out.Incomplete = true
 			out.Warnings = append(out.Warnings, fmt.Sprintf("%d %s in calendar %q held more than one main event; only the first of each was used",
 				cr.ignoredMasters, plural(cr.ignoredMasters, "entry", "entries"), cr.name))
 		}
@@ -350,8 +368,55 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 		out.Events = append(out.Events, svc.toEventOut(ni.calendar, ni.inst))
 	}
 
-	svc.log.Info("list_events done", "event_count", len(out.Events), "skipped_objects", skipped)
+	svc.log.Info("list_events done", "event_count", len(out.Events), "skipped_objects", skipped, "incomplete", out.Incomplete)
 	return nil, out, nil
+}
+
+// fetchCalendars queries targets[i] for each i in indices with client c,
+// at most maxConcurrentCalendarFetches at a time, storing each calendar's
+// outcome in results[i]. Each goroutine writes only its own slot, so
+// results keeps targets' order regardless of completion order.
+func (svc *Service) fetchCalendars(ctx context.Context, c calendarClient, targets []icloud.Calendar, indices []int, results []calInstances, start, end time.Time) {
+	var g errgroup.Group
+	g.SetLimit(maxConcurrentCalendarFetches)
+	for _, i := range indices {
+		g.Go(func() error {
+			results[i] = svc.fetchCalendar(ctx, c, targets[i], start, end)
+			return nil
+		})
+	}
+	g.Wait() // never returns an error: each one is kept in its result
+}
+
+// fetchCalendar queries and expands one calendar's events in [start, end).
+func (svc *Service) fetchCalendar(ctx context.Context, c calendarClient, cal icloud.Calendar, start, end time.Time) calInstances {
+	ci := calInstances{name: cal.Name}
+	objs, err := c.FetchObjects(ctx, cal.Path, start, end)
+	if err != nil {
+		ci.fetchErr = err
+		return ci
+	}
+	for _, obj := range objs {
+		if obj.Data == nil {
+			continue
+		}
+		events := obj.Data.Events()
+		x, err := icloud.Expand(cal.Path, obj.Path, events, icloud.Timezones(obj.Data), start, end, svc.cfg.DefaultLocation)
+		if err != nil {
+			// One malformed calendar object mustn't sink the whole
+			// listing. Log only identifiers, never event content.
+			svc.log.Warn("list_events: skipping unparseable calendar object",
+				"object_path", obj.Path, "uid", firstUID(events), "error", err)
+			ci.skipped++
+			continue
+		}
+		svc.logExpansionDiagnostics("list_events", obj.Path, events, x)
+		if x.IgnoredMasters > 0 {
+			ci.ignoredMasters++
+		}
+		ci.instances = append(ci.instances, x.Instances...)
+	}
+	return ci
 }
 
 // logExpansionDiagnostics logs, by identifiers only (never event content),
@@ -363,6 +428,10 @@ func (svc *Service) logExpansionDiagnostics(tool, objectPath string, events []ic
 	}
 	for _, tzid := range x.FallbackTZIDs {
 		svc.log.Warn(tool+": unrecognized TZID; interpreted in the default time zone",
+			"object_path", objectPath, "uid", firstUID(events), "tzid", tzid, "fallback_zone", svc.cfg.DefaultLocation.String())
+	}
+	for _, tzid := range x.ExclusionFallbackTZIDs {
+		svc.log.Warn(tool+": unrecognized TZID on an EXDATE; interpreted in the default time zone, so an excluded occurrence may still be listed",
 			"object_path", objectPath, "uid", firstUID(events), "tzid", tzid, "fallback_zone", svc.cfg.DefaultLocation.String())
 	}
 }
@@ -426,17 +495,16 @@ func (svc *Service) getEvent(ctx context.Context, _ *mcp.CallToolRequest, args G
 			return found{}, fmt.Errorf("event not found")
 		}
 
-		// A non-recurring event is returned wherever in time it falls. A
-		// recurring one is expanded over a generous window around the
-		// requested instance's slot, so it's found even if an override
-		// moved it.
+		// A non-recurring event is returned wherever in time it falls; so
+		// is one occurrence of a recurring series, looked up by its slot
+		// (RECURRENCE-ID) — even if an override moved it arbitrarily far.
 		events := obj.Data.Events()
+		timezones := icloud.Timezones(obj.Data)
 		var x icloud.Expansion
 		if id.RecurrenceID == nil {
-			x, err = icloud.SingleEvent(id.CalendarPath, id.ObjectPath, events, svc.cfg.DefaultLocation)
+			x, err = icloud.SingleEvent(id.CalendarPath, id.ObjectPath, events, timezones, svc.cfg.DefaultLocation)
 		} else {
-			anchor := *id.RecurrenceID
-			x, err = icloud.Expand(id.CalendarPath, id.ObjectPath, events, anchor.AddDate(-1, 0, 0), anchor.AddDate(1, 0, 0), svc.cfg.DefaultLocation)
+			x, err = icloud.Occurrence(id.CalendarPath, id.ObjectPath, events, timezones, *id.RecurrenceID, svc.cfg.DefaultLocation)
 		}
 		if err != nil {
 			return found{}, err
@@ -486,7 +554,7 @@ func matchesEventID(inst icloud.Instance, id icloud.EventID) bool {
 // --- create_event ---
 
 type CreateEventArgs struct {
-	Calendar string `json:"calendar" jsonschema:"The exact calendar name (from list_calendars) to create the event on."`
+	Calendar string `json:"calendar" jsonschema:"The calendar to create the event on: its exact name, or its id, both from list_calendars. Use the id when two calendars share a name."`
 	Title    string `json:"title" jsonschema:"The event's title."`
 	Start    string `json:"start" jsonschema:"Start time, as a full RFC3339 timestamp with a UTC offset."`
 	End      string `json:"end" jsonschema:"End time, as a full RFC3339 timestamp with a UTC offset. Must be after start."`
@@ -498,7 +566,9 @@ func (svc *Service) createEvent(ctx context.Context, _ *mcp.CallToolRequest, arg
 	if strings.TrimSpace(args.Title) == "" {
 		return nil, EventOut{}, fmt.Errorf("title must not be empty")
 	}
-	if !svc.cfg.IsCalendarAllowed(args.Calendar) {
+	// A calendar id's name is only known once it's resolved, so its
+	// allowlist check happens then (see resolveCalendar).
+	if _, isID := icloud.DecodeCalendarToken(args.Calendar); !isID && !svc.cfg.IsCalendarAllowed(args.Calendar) {
 		return nil, EventOut{}, fmt.Errorf("calendar %q is not on this server's allowlist", args.Calendar)
 	}
 	start, err := parseRFC3339(args.Start)
@@ -532,23 +602,28 @@ func (svc *Service) createEvent(ctx context.Context, _ *mcp.CallToolRequest, arg
 		Notes:    args.Notes,
 	}
 
-	inst, err := withClient(ctx, svc, func(c calendarClient) (icloud.Instance, error) {
+	type created struct {
+		calendar string
+		inst     icloud.Instance
+	}
+	res, err := withClient(ctx, svc, func(c calendarClient) (created, error) {
 		cals, err := c.ListCalendars(ctx)
 		if err != nil {
-			return icloud.Instance{}, err
+			return created{}, err
 		}
-		cal, err := calendarByName(cals, args.Calendar)
+		cal, err := resolveCalendar(cals, svc.cfg, args.Calendar)
 		if err != nil {
-			return icloud.Instance{}, err
+			return created{}, err
 		}
-		return c.CreateEvent(ctx, cal.Path, draft)
+		inst, err := c.CreateEvent(ctx, cal.Path, draft)
+		return created{calendar: cal.Name, inst: inst}, err
 	})
 	if err != nil {
 		return nil, EventOut{}, err
 	}
 
 	svc.log.Info("create_event done")
-	return nil, svc.toEventOut(args.Calendar, inst), nil
+	return nil, svc.toEventOut(res.calendar, res.inst), nil
 }
 
 // --- shared helpers ---
@@ -575,15 +650,36 @@ func findCalendar(cals []icloud.Calendar, pred func(icloud.Calendar) bool) (iclo
 	return icloud.Calendar{}, false
 }
 
+// resolveCalendar resolves create_event's calendar argument, which is
+// either a calendar id from list_calendars (see icloud.CalendarToken) or a
+// display name (see calendarByName), to an allow-listed calendar in cals.
+func resolveCalendar(cals []icloud.Calendar, cfg *config.Config, ref string) (icloud.Calendar, error) {
+	if calPath, ok := icloud.DecodeCalendarToken(ref); ok {
+		cal, found := findCalendar(cals, func(cal icloud.Calendar) bool { return cal.Path == calPath })
+		if !found {
+			return icloud.Calendar{}, fmt.Errorf("calendar id %q doesn't match any calendar in the iCloud account; call list_calendars for current ids", ref)
+		}
+		if !cfg.IsCalendarAllowed(cal.Name) {
+			return icloud.Calendar{}, fmt.Errorf("calendar %q is not on this server's allowlist", cal.Name)
+		}
+		return cal, nil
+	}
+	if !cfg.IsCalendarAllowed(ref) {
+		return icloud.Calendar{}, fmt.Errorf("calendar %q is not on this server's allowlist", ref)
+	}
+	return calendarByName(cals, ref)
+}
+
 // errAmbiguousCalendar is returned (wrapped) by calendarByName when more
 // than one calendar has the requested name.
 var errAmbiguousCalendar = errors.New("calendar name is ambiguous")
 
 // calendarByName resolves a calendar display name to the single calendar
 // with that name. iCloud lets two calendars (e.g. one's own and one shared
-// from another account) share a name, and callers only ever see names, so
-// rather than arbitrarily picking one — and, say, writing an event to the
-// wrong calendar — an ambiguous name is an error.
+// from another account) share a name, so rather than arbitrarily picking
+// one — and, say, writing an event to the wrong calendar — an ambiguous
+// name is an error; the caller can use the calendar's id instead (see
+// resolveCalendar).
 func calendarByName(cals []icloud.Calendar, name string) (icloud.Calendar, error) {
 	var match icloud.Calendar
 	n := 0
@@ -599,7 +695,7 @@ func calendarByName(cals []icloud.Calendar, name string) (icloud.Calendar, error
 	case 1:
 		return match, nil
 	default:
-		return icloud.Calendar{}, fmt.Errorf("%w: %d calendars in the iCloud account are named %q, so it's unclear which one to use; rename one of them in the Calendar app", errAmbiguousCalendar, n, name)
+		return icloud.Calendar{}, fmt.Errorf("%w: %d calendars in the iCloud account are named %q, so it's unclear which one to use; pass the id of the one you mean (from list_calendars) instead", errAmbiguousCalendar, n, name)
 	}
 }
 

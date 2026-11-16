@@ -50,3 +50,16 @@ func TestDecodeEventID_RejectsGarbage(t *testing.T) {
 		t.Fatal("expected an error for valid base64 with the wrong field count")
 	}
 }
+
+func TestCalendarTokenRoundTrip(t *testing.T) {
+	const p = "/123/calendars/ABC-def/"
+	tok := CalendarToken(p)
+	if got, ok := DecodeCalendarToken(tok); !ok || got != p {
+		t.Errorf("DecodeCalendarToken(%q) = %q, %v; want %q", tok, got, ok, p)
+	}
+	for _, notToken := range []string{"Home", "", "cal_", "cal_!!!", "cal_" + "aG9tZQ"} { // last: "home", not a path
+		if _, ok := DecodeCalendarToken(notToken); ok {
+			t.Errorf("DecodeCalendarToken(%q) accepted a non-token", notToken)
+		}
+	}
+}

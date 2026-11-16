@@ -67,3 +67,28 @@ func (i Instance) ID() string {
 		RecurrenceID: i.RecurrenceID,
 	}.Encode()
 }
+
+// calendarTokenPrefix marks a CalendarToken, so it's recognisable at a
+// glance and unlikely to be mistaken for a calendar's display name.
+const calendarTokenPrefix = "cal_"
+
+// CalendarToken returns an opaque token identifying the calendar at
+// calendarPath, for addressing a calendar unambiguously when two share a
+// display name. It's encoded like an EventID, but carries only the path.
+func CalendarToken(calendarPath string) string {
+	return calendarTokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(calendarPath))
+}
+
+// DecodeCalendarToken reverses CalendarToken. ok is false if s isn't a
+// well-formed token (e.g. it's a plain calendar name).
+func DecodeCalendarToken(s string) (calendarPath string, ok bool) {
+	rest, found := strings.CutPrefix(s, calendarTokenPrefix)
+	if !found {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(rest)
+	if err != nil || len(raw) == 0 || !strings.HasPrefix(string(raw), "/") {
+		return "", false
+	}
+	return string(raw), true
+}

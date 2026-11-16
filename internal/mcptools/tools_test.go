@@ -2,6 +2,7 @@ package mcptools
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	ical "github.com/emersion/go-ical"
 	"github.com/emersion/go-webdav/caldav"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/twallac10/ios-mcp/internal/config"
 	"github.com/twallac10/ios-mcp/internal/credentials"
@@ -34,6 +36,19 @@ type fakeClient struct {
 	objects map[string][]caldav.CalendarObject
 	// fetchErrs makes FetchObjects fail for the given calendar paths.
 	fetchErrs map[string]error
+	// fetchErrsOnce is fetchErrs for only the first FetchObjects call per
+	// calendar path.
+	fetchErrsOnce map[string]error
+	// fetchDelay makes each FetchObjects call take this long.
+	fetchDelay time.Duration
+
+	// mu guards the fields below, which FetchObjects (called
+	// concurrently) updates.
+	mu          sync.Mutex
+	fetchCounts map[string]int
+	inFlight    int
+	maxInFlight int
+	listCalls   int
 
 	getCalls    []string
 	createCalls []icloud.EventDraft
@@ -43,10 +58,32 @@ type fakeClient struct {
 }
 
 func (f *fakeClient) ListCalendars(context.Context) ([]icloud.Calendar, error) {
+	f.mu.Lock()
+	f.listCalls++
+	f.mu.Unlock()
 	return f.calendars, nil
 }
 
 func (f *fakeClient) FetchObjects(_ context.Context, calendarPath string, _, _ time.Time) ([]caldav.CalendarObject, error) {
+	f.mu.Lock()
+	if f.fetchCounts == nil {
+		f.fetchCounts = map[string]int{}
+	}
+	f.fetchCounts[calendarPath]++
+	first := f.fetchCounts[calendarPath] == 1
+	f.inFlight++
+	f.maxInFlight = max(f.maxInFlight, f.inFlight)
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
+	}()
+
+	time.Sleep(f.fetchDelay)
+	if err := f.fetchErrsOnce[calendarPath]; err != nil && first {
+		return nil, err
+	}
 	if err := f.fetchErrs[calendarPath]; err != nil {
 		return nil, err
 	}
@@ -410,8 +447,64 @@ func TestCreateEvent_AmbiguousCalendarName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listCalendars: %v", err)
 	}
-	if len(cals.Calendars) != 1 || len(cals.Warnings) != 1 {
-		t.Errorf("listCalendars = %+v, want Family once plus an ambiguity warning", cals)
+	if len(cals.Calendars) != 2 || len(cals.Warnings) != 1 || cals.Calendars[0].ID == cals.Calendars[1].ID {
+		t.Errorf("listCalendars = %+v, want both Family calendars with distinct ids, plus an ambiguity warning", cals)
+	}
+}
+
+func TestCreateEvent_ByCalendarIDDisambiguatesSharedName(t *testing.T) {
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{
+			{Path: "/1/calendars/family-mine/", Name: "Family"},
+			{Path: "/1/calendars/family-shared/", Name: "Family"},
+			{Path: "/1/calendars/secret/", Name: "Secret"},
+		},
+	}
+	svc, _ := newTestService(fake, "Family")
+
+	_, cals, err := svc.listCalendars(context.Background(), nil, ListCalendarsArgs{})
+	if err != nil {
+		t.Fatalf("listCalendars: %v", err)
+	}
+	sharedID := ""
+	for _, c := range cals.Calendars {
+		if path, _ := icloud.DecodeCalendarToken(c.ID); path == "/1/calendars/family-shared/" {
+			sharedID = c.ID
+		}
+	}
+	if sharedID == "" {
+		t.Fatalf("listCalendars = %+v, no id for the shared Family calendar", cals)
+	}
+
+	args := CreateEventArgs{Calendar: sharedID, Title: "Dinner", Start: "2026-11-17T18:00:00-06:00", End: "2026-11-17T19:00:00-06:00"}
+	_, out, err := svc.createEvent(context.Background(), nil, args)
+	if err != nil {
+		t.Fatalf("createEvent by id: %v", err)
+	}
+	if out.Calendar != "Family" {
+		t.Errorf("created event's calendar = %q, want Family", out.Calendar)
+	}
+	id, err := icloud.DecodeEventID(out.ID)
+	if err != nil || id.CalendarPath != "/1/calendars/family-shared/" {
+		t.Errorf("event created on %q (err %v), want /1/calendars/family-shared/", id.CalendarPath, err)
+	}
+
+	// The plain shared name is still refused.
+	args.Calendar = "Family"
+	if _, _, err := svc.createEvent(context.Background(), nil, args); !errors.Is(err, errAmbiguousCalendar) {
+		t.Errorf("createEvent by shared name err = %v, want errAmbiguousCalendar", err)
+	}
+
+	// An id can't reach a calendar that isn't allow-listed, or one that
+	// isn't in the account.
+	for _, calID := range []string{icloud.CalendarToken("/1/calendars/secret/"), icloud.CalendarToken("/1/calendars/gone/")} {
+		args.Calendar = calID
+		if _, _, err := svc.createEvent(context.Background(), nil, args); err == nil {
+			t.Errorf("createEvent with id %q succeeded; want an error", calID)
+		}
+	}
+	if len(fake.createCalls) != 1 {
+		t.Errorf("CreateEvent called %d times, want 1 (only the by-id create)", len(fake.createCalls))
 	}
 }
 
@@ -485,6 +578,9 @@ func TestListEvents_ManyCalendars(t *testing.T) {
 	if len(out.Warnings) != 2 || !strings.Contains(joined, `calendar "Cal5" could not be queried`) || !strings.Contains(joined, "more than one main event") {
 		t.Errorf("warnings = %q, want one about Cal5 and one about the duplicate master", out.Warnings)
 	}
+	if !out.Incomplete {
+		t.Error("incomplete = false with a calendar omitted; want true")
+	}
 }
 
 func TestListEvents_AllCalendarsFailingIsAnError(t *testing.T) {
@@ -508,6 +604,161 @@ func TestListEvents_AuthErrorOnOneCalendarIsRetried(t *testing.T) {
 	_, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"})
 	if !errors.Is(err, icloud.ErrUnauthorized) || len(*connects) != 2 {
 		t.Errorf("err=%v connects=%d, want ErrUnauthorized after one refreshed retry", err, len(*connects))
+	}
+}
+
+func TestListEvents_AuthRetryRefetchesOnlyFailedCalendars(t *testing.T) {
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{
+			{Path: "/1/calendars/a/", Name: "A"},
+			{Path: "/1/calendars/b/", Name: "B"},
+			{Path: "/1/calendars/c/", Name: "C"},
+		},
+		objects: map[string][]caldav.CalendarObject{},
+		// B's first query is rejected (say, the password was just rotated);
+		// it succeeds after the credentials are refreshed.
+		fetchErrsOnce: map[string]error{"/1/calendars/b/": fmt.Errorf("icloud: querying: %w", icloud.ErrUnauthorized)},
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		p := "/1/calendars/" + name + "/"
+		fake.objects[p] = []caldav.CalendarObject{object(t, p+name+".ics", singleEventICS(name, "DTSTART:20261117T150000Z", "DTEND:20261117T160000Z"))}
+	}
+	svc, connects := newTestService(fake, "A", "B", "C")
+
+	_, out, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"})
+	if err != nil {
+		t.Fatalf("listEvents: %v", err)
+	}
+	if len(out.Events) != 3 || out.Incomplete {
+		t.Errorf("events = %+v (incomplete %v), want all three", out.Events, out.Incomplete)
+	}
+	if len(*connects) != 2 || !(*connects)[1].refresh {
+		t.Errorf("connect calls = %+v, want a normal connect then one refresh", *connects)
+	}
+	want := map[string]int{"/1/calendars/a/": 1, "/1/calendars/b/": 2, "/1/calendars/c/": 1}
+	for p, n := range want {
+		if fake.fetchCounts[p] != n {
+			t.Errorf("calendar %s fetched %d times, want %d (only the rejected calendar is re-fetched)", p, fake.fetchCounts[p], n)
+		}
+	}
+	if fake.listCalls != 1 {
+		t.Errorf("ListCalendars called %d times, want 1", fake.listCalls)
+	}
+}
+
+func TestListEvents_BoundsConcurrentFetches(t *testing.T) {
+	fake := &fakeClient{fetchDelay: 20 * time.Millisecond}
+	var allow []string
+	for i := 0; i < 3*maxConcurrentCalendarFetches; i++ {
+		name := fmt.Sprintf("Cal%d", i)
+		fake.calendars = append(fake.calendars, icloud.Calendar{Path: fmt.Sprintf("/1/calendars/c%d/", i), Name: name})
+		allow = append(allow, name)
+	}
+	svc, _ := newTestService(fake, allow...)
+
+	if _, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"}); err != nil {
+		t.Fatalf("listEvents: %v", err)
+	}
+	if fake.maxInFlight > maxConcurrentCalendarFetches || fake.maxInFlight < 2 {
+		t.Errorf("max concurrent FetchObjects calls = %d, want between 2 and %d", fake.maxInFlight, maxConcurrentCalendarFetches)
+	}
+	if len(fake.fetchCounts) != len(fake.calendars) {
+		t.Errorf("fetched %d calendars, want all %d", len(fake.fetchCounts), len(fake.calendars))
+	}
+}
+
+func TestListEvents_AllowListedCalendarMissingFromAccount(t *testing.T) {
+	fake := &fakeClient{calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}}}
+	svc, _ := newTestService(fake, "Home", "Deleted")
+
+	_, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Calendar: "Deleted", Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"})
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("listEvents err = %v, want a calendar-not-found error", err)
+	}
+	// create_event says the same for the same calendar.
+	_, _, cerr := svc.createEvent(context.Background(), nil, CreateEventArgs{Calendar: "Deleted", Title: "x", Start: "2026-11-17T09:00:00Z", End: "2026-11-17T10:00:00Z"})
+	if cerr == nil || !strings.Contains(cerr.Error(), "not found") {
+		t.Errorf("createEvent err = %v, want a calendar-not-found error", cerr)
+	}
+
+	// Without a calendar argument, a missing allow-listed calendar is fine.
+	if _, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"}); err != nil {
+		t.Errorf("listEvents over all calendars: %v", err)
+	}
+}
+
+func TestGetEvent_RecurringOverrideMovedMoreThanAYear(t *testing.T) {
+	// The 2026-11-16 occurrence of a weekly series was rescheduled to
+	// 2028-03-01: more than a year from its original slot.
+	const ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//test//EN\n" +
+		"BEGIN:VEVENT\nUID:weekly\nDTSTAMP:20261001T000000Z\n" +
+		"DTSTART;TZID=America/Chicago:20261102T090000\nDTEND;TZID=America/Chicago:20261102T093000\n" +
+		"RRULE:FREQ=WEEKLY;BYDAY=MO\nSUMMARY:Standup\nEND:VEVENT\n" +
+		"BEGIN:VEVENT\nUID:weekly\nDTSTAMP:20261001T000000Z\n" +
+		"RECURRENCE-ID;TZID=America/Chicago:20261116T090000\n" +
+		"DTSTART;TZID=America/Chicago:20280301T100000\nDTEND;TZID=America/Chicago:20280301T103000\n" +
+		"SUMMARY:Standup (moved)\nEND:VEVENT\nEND:VCALENDAR\n"
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}},
+		objects: map[string][]caldav.CalendarObject{
+			"/1/calendars/home/": {object(t, "/1/calendars/home/weekly.ics", ics)},
+		},
+	}
+	svc, _ := newTestService(fake, "Home")
+
+	_, list, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2028-03-01T00:00:00-06:00", End: "2028-03-02T00:00:00-06:00"})
+	if err != nil {
+		t.Fatalf("listEvents: %v", err)
+	}
+	var moved *EventOut
+	for i := range list.Events {
+		if list.Events[i].Title == "Standup (moved)" {
+			moved = &list.Events[i]
+		}
+	}
+	if moved == nil {
+		t.Fatalf("list_events = %+v, want the moved occurrence", list.Events)
+	}
+
+	_, got, err := svc.getEvent(context.Background(), nil, GetEventArgs{ID: moved.ID})
+	if err != nil {
+		t.Fatalf("getEvent(id from list_events): %v", err)
+	}
+	if got.Title != "Standup (moved)" || got.Start != "2028-03-01T10:00:00-06:00" || got.RecurrenceID != "2026-11-16T09:00:00-06:00" {
+		t.Errorf("getEvent = %+v, want the moved occurrence", got)
+	}
+}
+
+func TestListEvents_ResolvesTZIDFromObjectVTIMEZONE(t *testing.T) {
+	// A TZID that's neither an IANA name nor a known Windows zone, defined
+	// by the object's own VTIMEZONE as a fixed UTC+05:30.
+	const ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//test//EN\n" +
+		"BEGIN:VTIMEZONE\nTZID:Customized Time Zone 7\nBEGIN:STANDARD\nDTSTART:19700101T000000\n" +
+		"TZOFFSETFROM:+0530\nTZOFFSETTO:+0530\nEND:STANDARD\nEND:VTIMEZONE\n" +
+		"BEGIN:VEVENT\nUID:vtz\nDTSTAMP:20261001T000000Z\n" +
+		"DTSTART;TZID=Customized Time Zone 7:20261117T090000\nDTEND;TZID=Customized Time Zone 7:20261117T100000\n" +
+		"SUMMARY:vtz\nEND:VEVENT\nEND:VCALENDAR\n"
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}},
+		objects: map[string][]caldav.CalendarObject{
+			"/1/calendars/home/": {object(t, "/1/calendars/home/vtz.ics", ics)},
+		},
+	}
+	svc, _ := newTestService(fake, "Home")
+
+	_, list, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-16T00:00:00Z", End: "2026-11-18T00:00:00Z"})
+	if err != nil || len(list.Events) != 1 {
+		t.Fatalf("listEvents = %+v, %v; want the one event", list, err)
+	}
+	ev := list.Events[0]
+	start, _ := time.Parse(time.RFC3339, ev.Start)
+	if !start.Equal(time.Date(2026, 11, 17, 3, 30, 0, 0, time.UTC)) || ev.TimezoneWarning != "" {
+		t.Errorf("event start = %s (warning %q), want 03:30Z per its VTIMEZONE, unflagged", ev.Start, ev.TimezoneWarning)
+	}
+
+	_, got, err := svc.getEvent(context.Background(), nil, GetEventArgs{ID: ev.ID})
+	if err != nil || got.Start != ev.Start {
+		t.Errorf("getEvent = %+v, %v; want the same start as list_events", got, err)
 	}
 }
 
@@ -559,4 +810,42 @@ func TestStoreConnector_ReusesClientUntilRefresh(t *testing.T) {
 	if d != c || built != 2 {
 		t.Errorf("connect after refresh built %d clients, want the refreshed client reused", built)
 	}
+}
+
+func TestRegister_ListEventsSchemaFlagsIncompleteResults(t *testing.T) {
+	svc, _ := newTestService(&fakeClient{}, "Home")
+	server := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	svc.Register(server)
+
+	ctx := context.Background()
+	st, ct := mcp.NewInMemoryTransports()
+	ss, err := server.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatalf("server.Connect: %v", err)
+	}
+	defer ss.Close()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "client", Version: "0"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	defer cs.Close()
+
+	tools, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name != "list_events" {
+			continue
+		}
+		if !strings.Contains(tool.Description, "`incomplete`") || !strings.Contains(tool.Description, "`warnings`") {
+			t.Errorf("list_events description doesn't tell callers to check incomplete/warnings: %q", tool.Description)
+		}
+		schema, _ := json.Marshal(tool.OutputSchema)
+		if !strings.Contains(string(schema), `"incomplete"`) || !strings.Contains(string(schema), "may be missing") {
+			t.Errorf("list_events output schema doesn't document incomplete: %s", schema)
+		}
+		return
+	}
+	t.Fatal("list_events not registered")
 }
