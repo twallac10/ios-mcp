@@ -19,7 +19,11 @@ account.
 
 - [ ] **Seed the iCloud credential**: with `ICLOUD_KEY_VAULT_NAME` set to
   the real vault name and `az login` completed, run
-  `go run ./cmd/seed-credentials` locally once.
+  `go run ./cmd/seed-credentials` locally once. This runs as *your own*
+  signed-in identity, which needs secret **write** access on the vault
+  (e.g. `Key Vault Secrets Officer`, or vault owner/admin). It's the only
+  thing that ever writes the secret — the deployed Function App only reads
+  it (see the Managed Identity step below).
 
 - [ ] **Local `func start` smoke test, against the real vault, before
   deploying**: install [Azure Functions Core
@@ -74,15 +78,21 @@ runs in Azure is exactly what you tested locally.
   az functionapp deployment source config-zip --name <function-app-name> --resource-group <rg> --src publish.zip
   ```
 
-- [ ] **Grant the Function App's Managed Identity Key Vault access**:
-  enable a system-assigned Managed Identity (`az functionapp identity
-  assign --name <function-app-name> --resource-group <rg>`), then grant it
-  `Key Vault Secrets Officer` scoped to the vault:
+- [ ] **Grant the Function App's Managed Identity read-only Key Vault
+  access**: enable a system-assigned Managed Identity (`az functionapp
+  identity assign --name <function-app-name> --resource-group <rg>`), then
+  grant it `Key Vault Secrets User` (read secret contents only) scoped to
+  the vault:
 
   ```bash
-  az role assignment create --role "Key Vault Secrets Officer" \
+  az role assignment create --role "Key Vault Secrets User" \
     --assignee <managed-identity-principal-id> --scope <vault-resource-id>
   ```
+
+  The server only ever reads the credential secret; writing it is done
+  solely by `cmd/seed-credentials` under your own `az login` identity (see
+  Part 1), so the Function App doesn't need, and shouldn't have, `Key Vault
+  Secrets Officer`.
 
   RBAC propagation can take a minute or two before the first call succeeds;
   without this, tool calls fail with `DefaultAzureCredential failed to

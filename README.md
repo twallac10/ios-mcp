@@ -88,7 +88,8 @@ before you touch the deploy step: Go is compiled, so there's no Oryx
 pip-install equivalent to go wrong at deploy time (see Concept2's Python
 3.12-vs-3.14 Oryx footnote) — you ship a single static binary instead. See
 [docs/runbook.md](docs/runbook.md) for exactly what that changes in the
-`func azure functionapp publish` step.
+deploy step (a zip deploy of `host.json` + the binary via
+`az functionapp deployment source config-zip`).
 
 ## Local development
 
@@ -148,7 +149,9 @@ ICLOUD_KEY_VAULT_NAME=your-vault-name go run ./cmd/seed-credentials
 Prompts for your Apple ID and an app-specific password (generate one at
 appleid.apple.com → Sign-In and Security → App-Specific Passwords) and
 saves both to Key Vault. You must be signed in locally via `az login` with
-write access to that vault. Re-run this any time you revoke/rotate the
+write access to that vault (only this local step needs write access; the
+deployed Function App's Managed Identity gets read-only `Key Vault Secrets
+User`). Re-run this any time you revoke/rotate the
 app-specific password — the server picks up the new value on its next
 credential load, retrying once automatically if iCloud rejects a cached
 one.

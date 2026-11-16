@@ -6,7 +6,10 @@ package icloud
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -33,11 +36,48 @@ type Client struct {
 	dav *caldav.Client
 }
 
+// ErrUnauthorized is returned (wrapped) by every Client method when iCloud
+// answers a request with HTTP 401, i.e. it rejected the Apple ID /
+// app-specific password. Detect it with errors.Is.
+var ErrUnauthorized = errors.New("icloud: unauthorized (HTTP 401)")
+
+// unauthorizedDetector wraps the HTTP client handed to go-webdav and turns a
+// raw 401 response into ErrUnauthorized before go-webdav sees it.
+//
+// go-webdav reports non-2xx responses as an *internal.HTTPError, a type in
+// its internal package that this module can't import (Go's internal-package
+// rule) and that has no public equivalent, so the status code can't be
+// recovered reliably from the error go-webdav returns. Checking the status
+// on the raw *http.Response here, and returning a sentinel error that
+// go-webdav passes through unchanged, avoids matching on rendered error text.
+type unauthorizedDetector struct {
+	next webdav.HTTPClient
+}
+
+func (d unauthorizedDetector) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.next.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, ErrUnauthorized
+	}
+	return resp, nil
+}
+
 // NewClient creates a Client authenticated as appleID using the given
 // app-specific password.
 func NewClient(appleID, appSpecificPassword string) (*Client, error) {
-	httpClient := webdav.HTTPClientWithBasicAuth(nil, appleID, appSpecificPassword)
-	dav, err := caldav.NewClient(httpClient, ServerURL)
+	return newClient(http.DefaultClient, ServerURL, appleID, appSpecificPassword)
+}
+
+// newClient is NewClient with an injectable transport and endpoint, for
+// tests against an httptest.Server.
+func newClient(httpClient webdav.HTTPClient, endpoint, appleID, appSpecificPassword string) (*Client, error) {
+	authed := webdav.HTTPClientWithBasicAuth(httpClient, appleID, appSpecificPassword)
+	dav, err := caldav.NewClient(unauthorizedDetector{next: authed}, endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("icloud: creating CalDAV client: %w", err)
 	}
@@ -74,6 +114,17 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 // recurrence — see ExpandEvents.
 func (c *Client) FetchObjects(ctx context.Context, calendarPath string, start, end time.Time) ([]caldav.CalendarObject, error) {
 	query := &caldav.CalendarQuery{
+		// Ask for the whole calendar object. go-webdav always encodes
+		// CompRequest as a <C:comp> inside <C:calendar-data>; left as its
+		// zero value that becomes <C:comp name=""/> with no allprop/allcomp,
+		// i.e. a request for a component with no name and no properties
+		// (RFC 4791 section 9.6.1), which a server may answer with empty or
+		// stripped calendar data.
+		CompRequest: caldav.CalendarCompRequest{
+			Name:     ical.CompCalendar,
+			AllProps: true,
+			AllComps: true,
+		},
 		CompFilter: caldav.CompFilter{
 			Name: ical.CompCalendar,
 			Comps: []caldav.CompFilter{
@@ -103,46 +154,85 @@ func (c *Client) GetObject(ctx context.Context, objectPath string) (*caldav.Cale
 	return obj, nil
 }
 
+// NewEventUID generates a UID for a new VEVENT, suffixed per RFC 5545's
+// recommendation to scope UIDs to a domain.
+//
+// Callers that may retry CreateEvent must generate the UID once, up front,
+// and reuse it on every attempt; see CreateEvent.
+func NewEventUID() (string, error) {
+	return newUID()
+}
+
+// EventDraft describes a new, single (non-recurring) event to create.
+type EventDraft struct {
+	// UID becomes both the VEVENT's UID and the object's file name. It must
+	// be stable across retries of the same logical create; use NewEventUID.
+	UID      string
+	Title    string
+	Start    time.Time
+	End      time.Time
+	Location string
+	Notes    string
+}
+
 // CreateEvent creates a new, single (non-recurring) VEVENT in the given
 // calendar and returns the resulting Instance.
-func (c *Client) CreateEvent(ctx context.Context, calendarPath string, title string, start, end time.Time, location, notes string) (Instance, error) {
-	uid, err := newUID()
-	if err != nil {
-		return Instance{}, err
+//
+// The object is written with an unconditional PUT to
+// <calendarPath>/<UID>.ics, so retrying with the same draft (same UID) is
+// idempotent: if an earlier attempt actually reached iCloud, the retry
+// overwrites that same object with identical content instead of creating a
+// second event. (go-webdav v0.7.0's PutCalendarObject doesn't support
+// If-None-Match, and with a stable UID a conditional create would only turn
+// a retry-after-success into a spurious 412.)
+func (c *Client) CreateEvent(ctx context.Context, calendarPath string, draft EventDraft) (Instance, error) {
+	if draft.UID == "" {
+		return Instance{}, fmt.Errorf("icloud: creating event: empty UID")
 	}
-
-	event := ical.NewEvent()
-	event.Props.SetText(ical.PropUID, uid)
-	event.Props.SetDateTime(ical.PropDateTimeStamp, time.Now().UTC())
-	event.Props.SetDateTime(ical.PropDateTimeStart, start)
-	event.Props.SetDateTime(ical.PropDateTimeEnd, end)
-	event.Props.SetText(ical.PropSummary, title)
-	if location != "" {
-		event.Props.SetText(ical.PropLocation, location)
-	}
-	if notes != "" {
-		event.Props.SetText(ical.PropDescription, notes)
-	}
+	event := buildEvent(draft, time.Now())
 
 	cal := ical.NewCalendar()
 	cal.Props.SetText(ical.PropProductID, "-//twallac10//ios-mcp//EN")
 	cal.Props.SetText(ical.PropVersion, "2.0")
 	cal.Children = append(cal.Children, event.Component)
 
-	objectPath := strings.TrimSuffix(calendarPath, "/") + "/" + uid + ".ics"
+	objectPath := strings.TrimSuffix(calendarPath, "/") + "/" + draft.UID + ".ics"
 	if _, err := c.dav.PutCalendarObject(ctx, objectPath, cal); err != nil {
 		return Instance{}, fmt.Errorf("icloud: creating event: %w", err)
 	}
 
 	return Instance{
-		UID:          uid,
+		UID:          draft.UID,
 		ObjectPath:   objectPath,
 		CalendarPath: calendarPath,
-		Title:        title,
-		Start:        start,
-		End:          end,
+		Title:        draft.Title,
+		Start:        draft.Start,
+		End:          draft.End,
 		AllDay:       false,
-		Location:     location,
-		Notes:        notes,
+		Location:     draft.Location,
+		Notes:        draft.Notes,
 	}, nil
+}
+
+// buildEvent renders draft as a VEVENT.
+//
+// DTSTART/DTEND are written in UTC ("...Z" form). go-ical's SetDateTime
+// writes any non-UTC time as TZID=<Location().String()>; a time parsed
+// from an RFC3339 string with a numeric offset (e.g. -06:00) has an unnamed
+// fixed-zone Location, which would produce an invalid "DTSTART;TZID=:..."
+// (or "TZID=Local"). UTC is unambiguous and always round-trips.
+func buildEvent(draft EventDraft, now time.Time) *ical.Event {
+	event := ical.NewEvent()
+	event.Props.SetText(ical.PropUID, draft.UID)
+	event.Props.SetDateTime(ical.PropDateTimeStamp, now.UTC())
+	event.Props.SetDateTime(ical.PropDateTimeStart, draft.Start.UTC())
+	event.Props.SetDateTime(ical.PropDateTimeEnd, draft.End.UTC())
+	event.Props.SetText(ical.PropSummary, draft.Title)
+	if draft.Location != "" {
+		event.Props.SetText(ical.PropLocation, draft.Location)
+	}
+	if draft.Notes != "" {
+		event.Props.SetText(ical.PropDescription, draft.Notes)
+	}
+	return event
 }

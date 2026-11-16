@@ -21,6 +21,8 @@ import (
 	"os"
 	"strings"
 
+	"golang.org/x/term"
+
 	"github.com/twallac10/ios-mcp/internal/credentials"
 )
 
@@ -41,16 +43,16 @@ func main() {
 	}
 	appleID = strings.TrimSpace(appleID)
 
-	// Typed into the running prompt (visible on screen, but never a
-	// command-line argument), so it never lands in shell history, argv,
-	// or any log — unlike `az keyvault secret set --value ...`.
+	// Typed into the running prompt (never a command-line argument), so it
+	// never lands in shell history, argv, or any log — unlike
+	// `az keyvault secret set --value ...`. On a terminal it isn't echoed;
+	// piped input (stdin not a terminal) is read as a plain line.
 	fmt.Print("App-specific password (from appleid.apple.com): ")
-	passwordLine, err := reader.ReadString('\n')
+	password, err := readSecret(reader)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reading app-specific password: %v\n", err)
 		os.Exit(1)
 	}
-	password := strings.TrimSpace(passwordLine)
 
 	if appleID == "" || password == "" {
 		fmt.Fprintln(os.Stderr, "both the Apple ID and the app-specific password are required")
@@ -70,4 +72,17 @@ func main() {
 	}
 
 	fmt.Println("Saved. The server will pick this up on its next credential load (or immediately, if it's never loaded credentials yet).")
+}
+
+// readSecret reads one line without echoing it when stdin is a terminal,
+// falling back to a plain buffered line read otherwise.
+func readSecret(reader *bufio.Reader) (string, error) {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Println()
+		return strings.TrimSpace(string(b)), err
+	}
+	line, err := reader.ReadString('\n')
+	return strings.TrimSpace(line), err
 }

@@ -3,5 +3,4 @@
 local.settings.json
 tests
 docs
-__pycache__
 .worktrees

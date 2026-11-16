@@ -65,12 +65,16 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", handler)
 
-	port := os.Getenv("FUNCTIONS_CUSTOMHANDLER_PORT")
+	// host.json declares port 8000 for local `func start`; in Azure the host
+	// sets FUNCTIONS_CUSTOMHANDLER_PORT. Log both so a mismatch is visible.
+	envPort := os.Getenv("FUNCTIONS_CUSTOMHANDLER_PORT")
+	port := envPort
 	if port == "" {
 		port = defaultPort
 	}
 
-	log.Info("starting iCloud Calendar MCP server", "port", port, "calendar_count", len(cfg.CalendarAllowlist))
+	log.Info("starting iCloud Calendar MCP server",
+		"port", port, "functions_customhandler_port_env", envPort, "calendar_count", len(cfg.CalendarAllowlist))
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Error("server exited", "error", err)
 		os.Exit(1)

@@ -10,6 +10,8 @@ require (
 	github.com/emersion/go-webdav v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/teambition/rrule-go v1.8.2
+	golang.org/x/term v0.48.0
 )
 
 require (
@@ -22,7 +24,6 @@ require (
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
-	github.com/teambition/rrule-go v1.8.2 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/net v0.62.0 // indirect

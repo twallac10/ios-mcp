@@ -318,3 +318,258 @@ func TestExpandEvents_OutsideWindowIsExcluded(t *testing.T) {
 		t.Fatalf("got %d instances, want 1 (only Nov 2 falls in this narrow window)", len(instances))
 	}
 }
+
+func instanceStarts(instances []Instance) []string {
+	out := make([]string, len(instances))
+	for i, inst := range instances {
+		out[i] = inst.Start.Format(time.RFC3339)
+	}
+	return out
+}
+
+func TestExpandEvents_MultiValueEXDATE(t *testing.T) {
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:multi-exdate@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=America/Chicago:20261102T090000
+DTEND;TZID=America/Chicago:20261102T093000
+RRULE:FREQ=WEEKLY;BYDAY=MO
+EXDATE;TZID=America/Chicago:20261109T090000,20261116T090000
+SUMMARY:Standup
+END:VEVENT
+END:VCALENDAR
+`
+	instances, err := ExpandEvents("/cal/", "/cal/x.ics", parseEvents(t, raw),
+		mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents() error = %v", err)
+	}
+	// Mondays 2, 9, 16, 23, 30 minus the two EXDATEs.
+	want := []string{"2026-11-02T09:00:00-06:00", "2026-11-23T09:00:00-06:00", "2026-11-30T09:00:00-06:00"}
+	if got := instanceStarts(instances); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("starts = %v, want %v", got, want)
+	}
+}
+
+func TestExpandEvents_NonIANATZIDs(t *testing.T) {
+	// A Windows zone ID (as Exchange sends) resolves to its IANA zone; an
+	// unrecognisable label falls back to the default location rather than
+	// failing the whole object.
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:windows-tz@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=Eastern Standard Time:20261117T100000
+DTEND;TZID=Eastern Standard Time:20261117T110000
+SUMMARY:From Exchange
+END:VEVENT
+END:VCALENDAR
+`
+	instances, err := ExpandEvents("/cal/", "/cal/a.ics", parseEvents(t, raw),
+		mustParse(t, "2026-11-17T00:00:00"), mustParse(t, "2026-11-18T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents(windows tz) error = %v", err)
+	}
+	if len(instances) != 1 || !instances[0].Start.Equal(mustParse(t, "2026-11-17T09:00:00")) {
+		t.Errorf("windows-tz instances = %v, want one at 10:00 Eastern (09:00 Chicago)", instanceStarts(instances))
+	}
+
+	const rawUnknown = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:unknown-tz@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=Customized Time Zone 1:20261102T090000
+DTEND;TZID=Customized Time Zone 1:20261102T093000
+RRULE:FREQ=WEEKLY;COUNT=3
+EXDATE;TZID=Customized Time Zone 1:20261109T090000
+SUMMARY:Odd zone
+END:VEVENT
+END:VCALENDAR
+`
+	instances, err = ExpandEvents("/cal/", "/cal/b.ics", parseEvents(t, rawUnknown),
+		mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents(unknown tz) error = %v", err)
+	}
+	want := []string{"2026-11-02T09:00:00-06:00", "2026-11-16T09:00:00-06:00"}
+	if got := instanceStarts(instances); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("unknown-tz starts = %v, want %v", got, want)
+	}
+}
+
+func TestExpandEvents_UnparseableObjectIsAnError(t *testing.T) {
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:broken@example.com
+DTSTAMP:20261001T000000Z
+DTSTART:not-a-date
+SUMMARY:Broken
+END:VEVENT
+END:VCALENDAR
+`
+	_, err := ExpandEvents("/cal/", "/cal/broken.ics", parseEvents(t, raw),
+		mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err == nil {
+		t.Fatal("ExpandEvents() on an unparseable DTSTART returned no error")
+	}
+}
+
+func TestExpandEvents_RecurringAllDayAcrossDST(t *testing.T) {
+	// Weekly all-day Sunday event; US DST starts Sunday 2026-03-08, a 23h
+	// local day, and ends Sunday 2026-11-01, a 25h one.
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:sunday@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;VALUE=DATE:20260222
+DTEND;VALUE=DATE:20260223
+RRULE:FREQ=WEEKLY
+SUMMARY:Sunday thing
+END:VEVENT
+END:VCALENDAR
+`
+	events := parseEvents(t, raw)
+
+	// The day after each transition must not include the Sunday event.
+	for _, day := range []string{"2026-03-09", "2026-11-02"} {
+		ws := mustParse(t, day+"T00:00:00")
+		instances, err := ExpandEvents("/cal/", "/cal/sunday.ics", events, ws, ws.AddDate(0, 0, 1), chicago)
+		if err != nil {
+			t.Fatalf("ExpandEvents() error = %v", err)
+		}
+		if len(instances) != 0 {
+			t.Errorf("Monday %s: got %v, want no instances (Sunday all-day event bled over)", day, instanceStarts(instances))
+		}
+	}
+
+	// And every occurrence spans exactly local midnight to local midnight.
+	instances, err := ExpandEvents("/cal/", "/cal/sunday.ics", events,
+		mustParse(t, "2026-02-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents() error = %v", err)
+	}
+	if len(instances) == 0 {
+		t.Fatal("no instances")
+	}
+	for _, inst := range instances {
+		s, e := inst.Start, inst.End
+		if s.Hour() != 0 || e.Hour() != 0 || e.Minute() != 0 || calendarDaysBetween(s, e) != 1 || s.Weekday() != time.Sunday {
+			t.Errorf("occurrence [%v, %v) is not one local Sunday midnight-to-midnight", s, e)
+		}
+	}
+}
+
+func TestExpandEvents_LongOccurrenceQueriedMidSpan(t *testing.T) {
+	// A 5-day annual all-day event (Nov 2-6). Querying Nov 5 alone must find
+	// it even though it started more than expansionPad earlier.
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:conference@example.com
+DTSTAMP:20251001T000000Z
+DTSTART;VALUE=DATE:20251102
+DTEND;VALUE=DATE:20251107
+RRULE:FREQ=YEARLY
+SUMMARY:Conference
+END:VEVENT
+END:VCALENDAR
+`
+	ws := mustParse(t, "2026-11-05T00:00:00")
+	instances, err := ExpandEvents("/cal/", "/cal/conf.ics", parseEvents(t, raw), ws, ws.AddDate(0, 0, 1), chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents() error = %v", err)
+	}
+	if len(instances) != 1 || !instances[0].Start.Equal(mustParse(t, "2026-11-02T00:00:00")) {
+		t.Fatalf("got %v, want the 2026 occurrence starting Nov 2", instanceStarts(instances))
+	}
+	if want := mustParse(t, "2026-11-07T00:00:00"); !instances[0].End.Equal(want) {
+		t.Errorf("end = %v, want %v", instances[0].End, want)
+	}
+}
+
+func TestExpandEvents_UntilIncludesLastOccurrence(t *testing.T) {
+	cases := []struct {
+		name, dtstart, dtend, rrule string
+		want                        []string
+	}{
+		{
+			name:    "all-day with DATE UNTIL",
+			dtstart: "DTSTART;VALUE=DATE:20261102",
+			dtend:   "DTEND;VALUE=DATE:20261103",
+			rrule:   "RRULE:FREQ=DAILY;UNTIL=20261105",
+			want:    []string{"2026-11-02T00:00:00-06:00", "2026-11-03T00:00:00-06:00", "2026-11-04T00:00:00-06:00", "2026-11-05T00:00:00-06:00"},
+		},
+		{
+			name:    "TZID with floating UNTIL",
+			dtstart: "DTSTART;TZID=America/Chicago:20261102T090000",
+			dtend:   "DTEND;TZID=America/Chicago:20261102T100000",
+			rrule:   "RRULE:FREQ=DAILY;UNTIL=20261104T090000",
+			want:    []string{"2026-11-02T09:00:00-06:00", "2026-11-03T09:00:00-06:00", "2026-11-04T09:00:00-06:00"},
+		},
+		{
+			name:    "TZID with DATE UNTIL",
+			dtstart: "DTSTART;TZID=America/Chicago:20261102T090000",
+			dtend:   "DTEND;TZID=America/Chicago:20261102T100000",
+			rrule:   "RRULE:FREQ=DAILY;UNTIL=20261104",
+			want:    []string{"2026-11-02T09:00:00-06:00", "2026-11-03T09:00:00-06:00", "2026-11-04T09:00:00-06:00"},
+		},
+		{
+			name:    "UTC UNTIL unchanged",
+			dtstart: "DTSTART;TZID=America/Chicago:20261102T090000",
+			dtend:   "DTEND;TZID=America/Chicago:20261102T100000",
+			rrule:   "RRULE:FREQ=DAILY;UNTIL=20261104T145959Z",
+			want:    []string{"2026-11-02T09:00:00-06:00", "2026-11-03T09:00:00-06:00"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//test//EN\nBEGIN:VEVENT\nUID:until@example.com\nDTSTAMP:20261001T000000Z\n" +
+				tc.dtstart + "\n" + tc.dtend + "\n" + tc.rrule + "\nSUMMARY:Until\nEND:VEVENT\nEND:VCALENDAR\n"
+			instances, err := ExpandEvents("/cal/", "/cal/until.ics", parseEvents(t, raw),
+				mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+			if err != nil {
+				t.Fatalf("ExpandEvents() error = %v", err)
+			}
+			if got := instanceStarts(instances); strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Errorf("starts = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExpandEvents_CancelledRecurringMasterIsOmitted(t *testing.T) {
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:cancelled-series@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=America/Chicago:20261102T090000
+DTEND;TZID=America/Chicago:20261102T093000
+RRULE:FREQ=WEEKLY;BYDAY=MO
+STATUS:CANCELLED
+SUMMARY:Cancelled series
+END:VEVENT
+END:VCALENDAR
+`
+	instances, err := ExpandEvents("/cal/", "/cal/c.ics", parseEvents(t, raw),
+		mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents() error = %v", err)
+	}
+	if len(instances) != 0 {
+		t.Errorf("got %v, want no instances for a cancelled series", instanceStarts(instances))
+	}
+}

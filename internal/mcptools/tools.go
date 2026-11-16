@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"sort"
 	"strings"
 	"time"
 
+	ical "github.com/emersion/go-ical"
+	"github.com/emersion/go-webdav/caldav"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/twallac10/ios-mcp/internal/config"
@@ -35,19 +38,48 @@ var writeNonDestructive = &mcp.ToolAnnotations{
 	OpenWorldHint:   boolPtr(true),
 }
 
+// calendarClient is the subset of *icloud.Client the tool handlers use;
+// a seam so the handlers can be tested without iCloud.
+type calendarClient interface {
+	ListCalendars(ctx context.Context) ([]icloud.Calendar, error)
+	FetchObjects(ctx context.Context, calendarPath string, start, end time.Time) ([]caldav.CalendarObject, error)
+	GetObject(ctx context.Context, objectPath string) (*caldav.CalendarObject, error)
+	CreateEvent(ctx context.Context, calendarPath string, draft icloud.EventDraft) (icloud.Instance, error)
+}
+
 // Service holds this server's dependencies and implements each tool's
 // handler as a method.
 type Service struct {
-	cfg   *config.Config
-	store *credentials.Store
-	log   *slog.Logger
+	cfg *config.Config
+	log *slog.Logger
+
+	// connect builds a client from the stored iCloud credentials. With
+	// refresh set, it first drops any cached credentials so they're
+	// re-read from Key Vault.
+	connect func(ctx context.Context, refresh bool) (calendarClient, error)
 }
 
 // NewService creates a Service. log must never be given event content
 // (titles, locations, notes) to write at Info level or above — see
 // package-level docs and the README's logging notes.
 func NewService(cfg *config.Config, store *credentials.Store, log *slog.Logger) *Service {
-	return &Service{cfg: cfg, store: store, log: log}
+	return &Service{cfg: cfg, log: log, connect: storeConnector(store)}
+}
+
+func storeConnector(store *credentials.Store) func(context.Context, bool) (calendarClient, error) {
+	return func(ctx context.Context, refresh bool) (calendarClient, error) {
+		if refresh {
+			store.Invalidate()
+		}
+		creds, err := store.Load(ctx)
+		if err != nil {
+			if errors.Is(err, credentials.ErrNotFound) {
+				return nil, fmt.Errorf("no iCloud credentials are configured; run cmd/seed-credentials once to store an Apple ID and app-specific password")
+			}
+			return nil, fmt.Errorf("loading iCloud credentials: %w", err)
+		}
+		return icloud.NewClient(creds.AppleID, creds.AppSpecificPassword)
+	}
 }
 
 // Register adds every iCloud Calendar tool to s.
@@ -93,7 +125,7 @@ type ListCalendarsResult struct {
 func (svc *Service) listCalendars(ctx context.Context, _ *mcp.CallToolRequest, _ ListCalendarsArgs) (*mcp.CallToolResult, ListCalendarsResult, error) {
 	svc.log.Info("list_calendars")
 
-	cals, err := withClient(ctx, svc, func(c *icloud.Client) ([]icloud.Calendar, error) {
+	cals, err := withClient(ctx, svc, func(c calendarClient) ([]icloud.Calendar, error) {
 		return c.ListCalendars(ctx)
 	})
 	if err != nil {
@@ -135,6 +167,9 @@ type EventOut struct {
 
 type ListEventsResult struct {
 	Events []EventOut `json:"events"`
+	// Warnings notes anything left out of Events, e.g. calendar entries
+	// that couldn't be parsed. Never contains event content.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args ListEventsArgs) (*mcp.CallToolResult, ListEventsResult, error) {
@@ -159,9 +194,10 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 	type calInstances struct {
 		name      string
 		instances []icloud.Instance
+		skipped   int
 	}
 
-	results, err := withClient(ctx, svc, func(c *icloud.Client) ([]calInstances, error) {
+	results, err := withClient(ctx, svc, func(c calendarClient) ([]calInstances, error) {
 		cals, err := c.ListCalendars(ctx)
 		if err != nil {
 			return nil, err
@@ -181,18 +217,24 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 				return nil, fmt.Errorf("calendar %q: %w", cal.Name, err)
 			}
 
-			var instances []icloud.Instance
+			ci := calInstances{name: cal.Name}
 			for _, obj := range objs {
 				if obj.Data == nil {
 					continue
 				}
-				expanded, err := icloud.ExpandEvents(cal.Path, obj.Path, obj.Data.Events(), start, end, svc.cfg.DefaultLocation)
+				events := obj.Data.Events()
+				expanded, err := icloud.ExpandEvents(cal.Path, obj.Path, events, start, end, svc.cfg.DefaultLocation)
 				if err != nil {
-					return nil, fmt.Errorf("calendar %q: %w", cal.Name, err)
+					// One malformed calendar object mustn't sink the whole
+					// listing. Log only identifiers, never event content.
+					svc.log.Warn("list_events: skipping unparseable calendar object",
+						"object_path", obj.Path, "uid", firstUID(events), "error", err)
+					ci.skipped++
+					continue
 				}
-				instances = append(instances, expanded...)
+				ci.instances = append(ci.instances, expanded...)
 			}
-			out = append(out, calInstances{name: cal.Name, instances: instances})
+			out = append(out, ci)
 		}
 		return out, nil
 	})
@@ -200,16 +242,48 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 		return nil, ListEventsResult{}, err
 	}
 
+	type namedInstance struct {
+		calendar string
+		inst     icloud.Instance
+	}
+	var all []namedInstance
 	var out ListEventsResult
+	skipped := 0
 	for _, cr := range results {
 		for _, inst := range cr.instances {
-			out.Events = append(out.Events, toEventOut(cr.name, inst))
+			all = append(all, namedInstance{calendar: cr.name, inst: inst})
+		}
+		if cr.skipped > 0 {
+			skipped += cr.skipped
+			out.Warnings = append(out.Warnings, fmt.Sprintf("%d %s in calendar %q could not be parsed and %s omitted",
+				cr.skipped, plural(cr.skipped, "entry", "entries"), cr.name, plural(cr.skipped, "was", "were")))
 		}
 	}
-	sort.Slice(out.Events, func(i, j int) bool { return out.Events[i].Start < out.Events[j].Start })
+	// Sort by instant, not by the formatted RFC3339 string: strings with
+	// different UTC offsets don't sort chronologically.
+	sort.SliceStable(all, func(i, j int) bool { return all[i].inst.Start.Before(all[j].inst.Start) })
+	for _, ni := range all {
+		out.Events = append(out.Events, toEventOut(ni.calendar, ni.inst))
+	}
 
-	svc.log.Info("list_events done", "event_count", len(out.Events))
+	svc.log.Info("list_events done", "event_count", len(out.Events), "skipped_objects", skipped)
 	return nil, out, nil
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+func firstUID(events []ical.Event) string {
+	for _, e := range events {
+		if prop := e.Props.Get(ical.PropUID); prop != nil {
+			return prop.Value
+		}
+	}
+	return ""
 }
 
 // --- get_event ---
@@ -226,13 +300,37 @@ func (svc *Service) getEvent(ctx context.Context, _ *mcp.CallToolRequest, args G
 
 	svc.log.Info("get_event")
 
-	inst, err := withClient(ctx, svc, func(c *icloud.Client) (icloud.Instance, error) {
+	type found struct {
+		calendar string
+		inst     icloud.Instance
+	}
+	res, err := withClient(ctx, svc, func(c calendarClient) (found, error) {
+		// Authorize before fetching anything: the id is client-supplied, so
+		// its calendar must be an allow-listed calendar in this account and
+		// its object must actually live in that calendar. Otherwise an id
+		// pairing an allowed CalendarPath with another calendar's
+		// ObjectPath would read that calendar's event.
+		cals, err := c.ListCalendars(ctx)
+		if err != nil {
+			return found{}, err
+		}
+		calName := ""
+		for _, cal := range cals {
+			if cal.Path == id.CalendarPath && svc.cfg.IsCalendarAllowed(cal.Name) {
+				calName = cal.Name
+				break
+			}
+		}
+		if calName == "" || !objectInCalendar(id.ObjectPath, id.CalendarPath) {
+			return found{}, errEventNotAllowed
+		}
+
 		obj, err := c.GetObject(ctx, id.ObjectPath)
 		if err != nil {
-			return icloud.Instance{}, err
+			return found{}, err
 		}
 		if obj.Data == nil {
-			return icloud.Instance{}, fmt.Errorf("event not found")
+			return found{}, fmt.Errorf("event not found")
 		}
 
 		// Expand over a generous window around the requested instant (or,
@@ -247,28 +345,37 @@ func (svc *Service) getEvent(ctx context.Context, _ *mcp.CallToolRequest, args G
 
 		instances, err := icloud.ExpandEvents(id.CalendarPath, id.ObjectPath, obj.Data.Events(), windowStart, windowEnd, svc.cfg.DefaultLocation)
 		if err != nil {
-			return icloud.Instance{}, err
+			return found{}, err
 		}
 		for _, candidate := range instances {
 			if matchesEventID(candidate, id) {
-				return candidate, nil
+				return found{calendar: calName, inst: candidate}, nil
 			}
 		}
-		return icloud.Instance{}, fmt.Errorf("event not found")
+		return found{}, fmt.Errorf("event not found")
 	})
 	if err != nil {
 		return nil, EventOut{}, err
 	}
 
-	calName, err := svc.calendarNameForPath(ctx, id.CalendarPath)
-	if err != nil {
-		return nil, EventOut{}, err
-	}
-	if calName == "" {
-		return nil, EventOut{}, fmt.Errorf("event's calendar is not on this server's allowlist")
-	}
+	return nil, toEventOut(res.calendar, res.inst), nil
+}
 
-	return nil, toEventOut(calName, inst), nil
+var errEventNotAllowed = errors.New("event's calendar is not on this server's allowlist")
+
+// objectInCalendar reports whether objectPath names a resource directly
+// inside the calendar collection at calendarPath (CalDAV calendar objects
+// are immediate children of their collection). An objectPath that isn't
+// already in clean form (e.g. contains "..") is rejected outright rather
+// than trusted to resolve the way it looks.
+func objectInCalendar(objectPath, calendarPath string) bool {
+	if !strings.HasPrefix(objectPath, "/") || !strings.HasPrefix(calendarPath, "/") {
+		return false
+	}
+	if path.Clean(objectPath) != objectPath {
+		return false
+	}
+	return path.Dir(objectPath) == path.Clean(calendarPath)
 }
 
 func matchesEventID(inst icloud.Instance, id icloud.EventID) bool {
@@ -313,7 +420,24 @@ func (svc *Service) createEvent(ctx context.Context, _ *mcp.CallToolRequest, arg
 
 	svc.log.Info("create_event", "calendar", args.Calendar)
 
-	inst, err := withClient(ctx, svc, func(c *icloud.Client) (icloud.Instance, error) {
+	// Generate the UID once, outside the retried closure: if the first
+	// attempt reached iCloud before a 401-triggered retry, the retry PUTs
+	// the same <UID>.ics again (an idempotent overwrite) instead of
+	// creating a duplicate event under a fresh UID.
+	uid, err := icloud.NewEventUID()
+	if err != nil {
+		return nil, EventOut{}, fmt.Errorf("generating event UID: %w", err)
+	}
+	draft := icloud.EventDraft{
+		UID:      uid,
+		Title:    args.Title,
+		Start:    start,
+		End:      end,
+		Location: args.Location,
+		Notes:    args.Notes,
+	}
+
+	inst, err := withClient(ctx, svc, func(c calendarClient) (icloud.Instance, error) {
 		cals, err := c.ListCalendars(ctx)
 		if err != nil {
 			return icloud.Instance{}, err
@@ -328,7 +452,7 @@ func (svc *Service) createEvent(ctx context.Context, _ *mcp.CallToolRequest, arg
 		if calPath == "" {
 			return icloud.Instance{}, fmt.Errorf("calendar %q was not found in the iCloud account", args.Calendar)
 		}
-		return c.CreateEvent(ctx, calPath, args.Title, start, end, args.Location, args.Notes)
+		return c.CreateEvent(ctx, calPath, draft)
 	})
 	if err != nil {
 		return nil, EventOut{}, err
@@ -339,21 +463,6 @@ func (svc *Service) createEvent(ctx context.Context, _ *mcp.CallToolRequest, arg
 }
 
 // --- shared helpers ---
-
-func (svc *Service) calendarNameForPath(ctx context.Context, path string) (string, error) {
-	cals, err := withClient(ctx, svc, func(c *icloud.Client) ([]icloud.Calendar, error) {
-		return c.ListCalendars(ctx)
-	})
-	if err != nil {
-		return "", err
-	}
-	for _, cal := range cals {
-		if cal.Path == path && svc.cfg.IsCalendarAllowed(cal.Name) {
-			return cal.Name, nil
-		}
-	}
-	return "", nil
-}
 
 func toEventOut(calendarName string, inst icloud.Instance) EventOut {
 	out := EventOut{
@@ -386,18 +495,13 @@ func parseRFC3339(value string) (time.Time, error) {
 // cache invalidated first — if iCloud rejects them as unauthorized. This
 // covers the case where the app-specific password was rotated via
 // cmd/seed-credentials since this server instance last started.
-func withClient[T any](ctx context.Context, svc *Service, fn func(*icloud.Client) (T, error)) (T, error) {
+//
+// fn may therefore run twice, so it must be safe to repeat (see
+// createEvent's UID handling).
+func withClient[T any](ctx context.Context, svc *Service, fn func(calendarClient) (T, error)) (T, error) {
 	var zero T
 
-	creds, err := svc.store.Load(ctx)
-	if err != nil {
-		if errors.Is(err, credentials.ErrNotFound) {
-			return zero, fmt.Errorf("no iCloud credentials are configured; run cmd/seed-credentials once to store an Apple ID and app-specific password")
-		}
-		return zero, fmt.Errorf("loading iCloud credentials: %w", err)
-	}
-
-	client, err := icloud.NewClient(creds.AppleID, creds.AppSpecificPassword)
+	client, err := svc.connect(ctx, false)
 	if err != nil {
 		return zero, err
 	}
@@ -408,24 +512,17 @@ func withClient[T any](ctx context.Context, svc *Service, fn func(*icloud.Client
 	}
 
 	svc.log.Info("iCloud rejected cached credentials, retrying once after refetch")
-	svc.store.Invalidate()
-	creds, err = svc.store.Load(ctx)
+	client, err = svc.connect(ctx, true)
 	if err != nil {
-		return zero, fmt.Errorf("loading iCloud credentials after a 401: %w", err)
-	}
-	client, err = icloud.NewClient(creds.AppleID, creds.AppSpecificPassword)
-	if err != nil {
-		return zero, err
+		return zero, fmt.Errorf("reconnecting after iCloud rejected credentials: %w", err)
 	}
 	return fn(client)
 }
 
-// isAuthError reports whether err looks like an HTTP 401 from iCloud.
-//
-// go-webdav's client wraps non-2xx responses in an unexported error type
-// from its internal package, which this module can't import (Go's
-// "internal" import restriction), so this falls back to matching on the
-// rendered error text ("401 Unauthorized").
+// isAuthError reports whether err is iCloud rejecting the credentials with
+// HTTP 401. icloud.Client detects the status on the raw HTTP response (see
+// icloud.ErrUnauthorized), so this doesn't depend on rendered error text,
+// which can contain "401" for unrelated reasons (e.g. in a path).
 func isAuthError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "401")
+	return errors.Is(err, icloud.ErrUnauthorized)
 }
