@@ -573,3 +573,216 @@ END:VCALENDAR
 		t.Errorf("got %v, want no instances for a cancelled series", instanceStarts(instances))
 	}
 }
+
+func TestExpandEvents_CancelledSeriesWithUnparseableRRULE(t *testing.T) {
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:cancelled-bad-rrule@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=America/Chicago:20261102T090000
+DTEND;TZID=America/Chicago:20261102T093000
+RRULE:FREQ=FORTNIGHTLY;BYDAY=XX
+STATUS:CANCELLED
+SUMMARY:Cancelled series
+END:VEVENT
+END:VCALENDAR
+`
+	ws, we := mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00")
+
+	// Test premise: the RRULE really is unparseable.
+	uncancelled := parseEvents(t, raw)
+	uncancelled[0].Props.Del(ical.PropStatus)
+	if _, err := ExpandEvents("/cal/", "/cal/c.ics", uncancelled, ws, we, chicago); err == nil {
+		t.Fatalf("test premise: expected a parse error for the RRULE when not cancelled")
+	}
+
+	instances, err := ExpandEvents("/cal/", "/cal/c.ics", parseEvents(t, raw), ws, we, chicago)
+	if err != nil {
+		t.Fatalf("ExpandEvents() error = %v, want none for a cancelled series", err)
+	}
+	if len(instances) != 0 {
+		t.Errorf("got %v, want no instances for a cancelled series", instanceStarts(instances))
+	}
+}
+
+func TestExpand_ReportsTZIDFallback(t *testing.T) {
+	const rawUnknown = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:unknown-tz@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=Customized Time Zone 1:20261102T090000
+DTEND;TZID=Customized Time Zone 1:20261102T093000
+RRULE:FREQ=WEEKLY;COUNT=3
+SUMMARY:Odd zone
+END:VEVENT
+BEGIN:VEVENT
+UID:unknown-tz@example.com
+DTSTAMP:20261001T000000Z
+RECURRENCE-ID;TZID=Customized Time Zone 1:20261109T090000
+DTSTART;TZID=Customized Time Zone 1:20261109T100000
+DTEND;TZID=Customized Time Zone 1:20261109T103000
+SUMMARY:Odd zone (moved)
+END:VEVENT
+END:VCALENDAR
+`
+	x, err := Expand("/cal/", "/cal/b.ics", parseEvents(t, rawUnknown),
+		mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	if strings.Join(x.FallbackTZIDs, "|") != "Customized Time Zone 1" {
+		t.Errorf("FallbackTZIDs = %q, want [Customized Time Zone 1]", x.FallbackTZIDs)
+	}
+	if len(x.Instances) != 3 {
+		t.Fatalf("got %d instances, want 3", len(x.Instances))
+	}
+	for _, inst := range x.Instances {
+		if inst.TZIDFallback != "Customized Time Zone 1" {
+			t.Errorf("instance at %s has TZIDFallback %q, want the unrecognized TZID", inst.Start, inst.TZIDFallback)
+		}
+	}
+
+	// IANA and known Windows zone IDs are resolved, not guessed.
+	const rawKnown = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:windows-tz@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=Eastern Standard Time:20261117T100000
+DTEND;TZID=America/New_York:20261117T110000
+SUMMARY:From Exchange
+END:VEVENT
+END:VCALENDAR
+`
+	x, err = Expand("/cal/", "/cal/a.ics", parseEvents(t, rawKnown),
+		mustParse(t, "2026-11-17T00:00:00"), mustParse(t, "2026-11-18T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	if len(x.FallbackTZIDs) != 0 || len(x.Instances) != 1 || x.Instances[0].TZIDFallback != "" {
+		t.Errorf("known zones reported as fallback: %+v", x)
+	}
+}
+
+func TestExpandEvents_InstantEventAtWindowStart(t *testing.T) {
+	// A timed event with neither DTEND nor DURATION lasts zero time (RFC
+	// 5545 section 3.6.1). The window's start is inclusive, its end
+	// exclusive.
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:instant@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=America/Chicago:20261117T090000
+SUMMARY:Reminder
+END:VEVENT
+END:VCALENDAR
+`
+	at := mustParse(t, "2026-11-17T09:00:00")
+	cases := []struct {
+		name       string
+		start, end time.Time
+		want       int
+	}{
+		{"at window start", at, at.Add(time.Hour), 1},
+		{"inside window", at.Add(-time.Hour), at.Add(time.Hour), 1},
+		{"at window end", at.Add(-time.Hour), at, 0},
+		{"before window", at.Add(time.Minute), at.Add(time.Hour), 0},
+	}
+	for _, tc := range cases {
+		instances, err := ExpandEvents("/cal/", "/cal/i.ics", parseEvents(t, raw), tc.start, tc.end, chicago)
+		if err != nil {
+			t.Fatalf("%s: ExpandEvents() error = %v", tc.name, err)
+		}
+		if len(instances) != tc.want {
+			t.Errorf("%s: got %d instances, want %d", tc.name, len(instances), tc.want)
+		}
+	}
+}
+
+func TestOverlaps(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	h := time.Hour
+	cases := []struct {
+		name                       string
+		aStart, aEnd, bStart, bEnd time.Time
+		want                       bool
+	}{
+		{"ends at window start", t0.Add(-h), t0, t0, t0.Add(h), false},
+		{"starts at window end", t0.Add(h), t0.Add(2 * h), t0, t0.Add(h), false},
+		{"starts at window start", t0, t0.Add(h), t0, t0.Add(h), true},
+		{"spans window", t0.Add(-h), t0.Add(2 * h), t0, t0.Add(h), true},
+		{"instant at window start", t0, t0, t0, t0.Add(h), true},
+		{"instant at window end", t0.Add(h), t0.Add(h), t0, t0.Add(h), false},
+		{"instant before window", t0.Add(-h), t0.Add(-h), t0, t0.Add(h), false},
+	}
+	for _, tc := range cases {
+		if got := overlaps(tc.aStart, tc.aEnd, tc.bStart, tc.bEnd); got != tc.want {
+			t.Errorf("%s: overlaps = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestExpand_ReportsIgnoredSecondMaster(t *testing.T) {
+	const raw = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//test//test//EN
+BEGIN:VEVENT
+UID:two-masters@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=America/Chicago:20261117T090000
+DTEND;TZID=America/Chicago:20261117T100000
+SUMMARY:First
+END:VEVENT
+BEGIN:VEVENT
+UID:two-masters@example.com
+DTSTAMP:20261001T000000Z
+DTSTART;TZID=America/Chicago:20261118T090000
+DTEND;TZID=America/Chicago:20261118T100000
+SUMMARY:Second
+END:VEVENT
+END:VCALENDAR
+`
+	x, err := Expand("/cal/", "/cal/two.ics", parseEvents(t, raw),
+		mustParse(t, "2026-11-01T00:00:00"), mustParse(t, "2026-12-01T00:00:00"), chicago)
+	if err != nil {
+		t.Fatalf("Expand() error = %v", err)
+	}
+	if x.IgnoredMasters != 1 {
+		t.Errorf("IgnoredMasters = %d, want 1", x.IgnoredMasters)
+	}
+	if len(x.Instances) != 1 || x.Instances[0].Title != "First" {
+		t.Errorf("instances = %+v, want only the first master", x.Instances)
+	}
+}
+
+func TestSingleEvent_IgnoresDate(t *testing.T) {
+	for _, dtstart := range []string{"20290301T150000Z", "20200301T150000Z"} {
+		raw := "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//test//EN\nBEGIN:VEVENT\nUID:far@example.com\n" +
+			"DTSTAMP:20261001T000000Z\nDTSTART:" + dtstart + "\nSUMMARY:Far\nEND:VEVENT\nEND:VCALENDAR\n"
+		x, err := SingleEvent("/cal/", "/cal/far.ics", parseEvents(t, raw), chicago)
+		if err != nil {
+			t.Fatalf("%s: SingleEvent() error = %v", dtstart, err)
+		}
+		if len(x.Instances) != 1 || x.Instances[0].RecurrenceID != nil {
+			t.Errorf("%s: instances = %+v, want the one non-recurring event", dtstart, x.Instances)
+		}
+	}
+
+	// A recurring series can't be enumerated without a window.
+	x, err := SingleEvent("/cal/", "/cal/w.ics", parseEvents(t, weeklyWithExceptionICS), chicago)
+	if err != nil {
+		t.Fatalf("SingleEvent(series) error = %v", err)
+	}
+	for _, inst := range x.Instances {
+		if inst.RecurrenceID == nil {
+			t.Errorf("SingleEvent(series) returned a non-recurring instance %+v", inst)
+		}
+	}
+}

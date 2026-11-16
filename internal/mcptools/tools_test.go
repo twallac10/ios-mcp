@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/emersion/go-webdav/caldav"
 
 	"github.com/twallac10/ios-mcp/internal/config"
+	"github.com/twallac10/ios-mcp/internal/credentials"
 	"github.com/twallac10/ios-mcp/internal/icloud"
 )
 
@@ -30,6 +32,8 @@ type fakeClient struct {
 	// objects maps a calendar path to the objects FetchObjects returns, and
 	// is also searched by GetObject.
 	objects map[string][]caldav.CalendarObject
+	// fetchErrs makes FetchObjects fail for the given calendar paths.
+	fetchErrs map[string]error
 
 	getCalls    []string
 	createCalls []icloud.EventDraft
@@ -43,6 +47,9 @@ func (f *fakeClient) ListCalendars(context.Context) ([]icloud.Calendar, error) {
 }
 
 func (f *fakeClient) FetchObjects(_ context.Context, calendarPath string, _, _ time.Time) ([]caldav.CalendarObject, error) {
+	if err := f.fetchErrs[calendarPath]; err != nil {
+		return nil, err
+	}
 	return f.objects[calendarPath], nil
 }
 
@@ -324,5 +331,232 @@ func TestListEvents_SkipsUnparseableObjectAndSortsByInstant(t *testing.T) {
 		if strings.Contains(w, "broken") {
 			t.Errorf("warning %q leaks event content", w)
 		}
+	}
+}
+
+func TestGetEvent_NonRecurringEventFarFromNow(t *testing.T) {
+	// More than a year from now in either direction: outside any window
+	// anchored on the current time.
+	for _, start := range []time.Time{time.Now().AddDate(1, 2, 0), time.Now().AddDate(-1, -2, 0)} {
+		dtstart := start.UTC().Format("20060102T150405Z")
+		dtend := start.Add(time.Hour).UTC().Format("20060102T150405Z")
+		fake := &fakeClient{
+			calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}},
+			objects: map[string][]caldav.CalendarObject{
+				"/1/calendars/home/": {object(t, "/1/calendars/home/far.ics", singleEventICS("far", "DTSTART:"+dtstart, "DTEND:"+dtend))},
+			},
+		}
+		svc, _ := newTestService(fake, "Home")
+
+		id := icloud.EventID{CalendarPath: "/1/calendars/home/", ObjectPath: "/1/calendars/home/far.ics", UID: "far"}.Encode()
+		_, out, err := svc.getEvent(context.Background(), nil, GetEventArgs{ID: id})
+		if err != nil {
+			t.Fatalf("getEvent(event at %s): %v", dtstart, err)
+		}
+		if out.Title != "far" || out.Start != start.Truncate(time.Second).UTC().Format(time.RFC3339) {
+			t.Errorf("getEvent(event at %s) = %+v", dtstart, out)
+		}
+	}
+}
+
+func TestGetEvent_UnrecognizedTZIDIsFlagged(t *testing.T) {
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}},
+		objects: map[string][]caldav.CalendarObject{
+			"/1/calendars/home/": {object(t, "/1/calendars/home/tz.ics", singleEventICS("tz",
+				"DTSTART;TZID=Customized Time Zone 1:20261117T090000", "DTEND;TZID=Customized Time Zone 1:20261117T100000"))},
+		},
+	}
+	var logs strings.Builder
+	svc, _ := newTestService(fake, "Home")
+	svc.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	id := icloud.EventID{CalendarPath: "/1/calendars/home/", ObjectPath: "/1/calendars/home/tz.ics", UID: "tz"}.Encode()
+	_, out, err := svc.getEvent(context.Background(), nil, GetEventArgs{ID: id})
+	if err != nil {
+		t.Fatalf("getEvent: %v", err)
+	}
+	if !strings.Contains(out.TimezoneWarning, "Customized Time Zone 1") || !strings.Contains(out.TimezoneWarning, "America/Chicago") {
+		t.Errorf("TimezoneWarning = %q, want it to name the TZID and the fallback zone", out.TimezoneWarning)
+	}
+	if !strings.Contains(logs.String(), `tzid="Customized Time Zone 1"`) || !strings.Contains(logs.String(), "fallback_zone=America/Chicago") {
+		t.Errorf("no TZID fallback warning logged:\n%s", logs.String())
+	}
+}
+
+func TestCreateEvent_AmbiguousCalendarName(t *testing.T) {
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{
+			{Path: "/1/calendars/family-mine/", Name: "Family"},
+			{Path: "/1/calendars/family-shared/", Name: "Family"},
+		},
+	}
+	svc, _ := newTestService(fake, "Family")
+
+	_, _, err := svc.createEvent(context.Background(), nil, CreateEventArgs{
+		Calendar: "Family",
+		Title:    "Dinner",
+		Start:    "2026-11-17T18:00:00-06:00",
+		End:      "2026-11-17T19:00:00-06:00",
+	})
+	if !errors.Is(err, errAmbiguousCalendar) || !strings.Contains(err.Error(), `"Family"`) {
+		t.Errorf("createEvent err = %v, want an ambiguity error naming the calendar", err)
+	}
+	if len(fake.createCalls) != 0 {
+		t.Errorf("CreateEvent was called %d times; must not write to either calendar", len(fake.createCalls))
+	}
+
+	_, cals, err := svc.listCalendars(context.Background(), nil, ListCalendarsArgs{})
+	if err != nil {
+		t.Fatalf("listCalendars: %v", err)
+	}
+	if len(cals.Calendars) != 1 || len(cals.Warnings) != 1 {
+		t.Errorf("listCalendars = %+v, want Family once plus an ambiguity warning", cals)
+	}
+}
+
+func TestListEvents_InstantEventAtWindowStart(t *testing.T) {
+	ics := "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//test//EN\nBEGIN:VEVENT\nUID:instant\n" +
+		"DTSTAMP:20261001T000000Z\nDTSTART:20261117T150000Z\nSUMMARY:instant\nEND:VEVENT\nEND:VCALENDAR\n"
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}},
+		objects: map[string][]caldav.CalendarObject{
+			"/1/calendars/home/": {object(t, "/1/calendars/home/i.ics", ics)},
+		},
+	}
+	svc, _ := newTestService(fake, "Home")
+
+	_, out, err := svc.listEvents(context.Background(), nil, ListEventsArgs{
+		Start: "2026-11-17T09:00:00-06:00", // == 15:00Z, the event's instant
+		End:   "2026-11-17T10:00:00-06:00",
+	})
+	if err != nil {
+		t.Fatalf("listEvents: %v", err)
+	}
+	if len(out.Events) != 1 || out.Events[0].Title != "instant" {
+		t.Errorf("events = %+v, want the instant event at the inclusive window start", out.Events)
+	}
+}
+
+func TestListEvents_ManyCalendars(t *testing.T) {
+	fake := &fakeClient{objects: map[string][]caldav.CalendarObject{}, fetchErrs: map[string]error{}}
+	var allow []string
+	var want []string
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("Cal%d", i)
+		calPath := fmt.Sprintf("/1/calendars/c%d/", i)
+		fake.calendars = append(fake.calendars, icloud.Calendar{Path: calPath, Name: name})
+		allow = append(allow, name)
+		if i == 5 {
+			fake.fetchErrs[calPath] = errors.New("503 Service Unavailable")
+			continue
+		}
+		// Reverse order of calendars, so sorting by start must reorder.
+		uid := fmt.Sprintf("e%d", i)
+		start := fmt.Sprintf("DTSTART:20261117T%02d0000Z", 20-i)
+		end := fmt.Sprintf("DTEND:20261117T%02d3000Z", 20-i)
+		fake.objects[calPath] = []caldav.CalendarObject{object(t, calPath+uid+".ics", singleEventICS(uid, start, end))}
+		want = append([]string{uid}, want...)
+	}
+	// Two masters in one object: reported, not silently dropped.
+	fake.objects["/1/calendars/c0/"] = append(fake.objects["/1/calendars/c0/"], object(t, "/1/calendars/c0/dup.ics",
+		"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//test//test//EN\n"+
+			"BEGIN:VEVENT\nUID:dup\nDTSTAMP:20261001T000000Z\nDTSTART:20261117T010000Z\nSUMMARY:dup\nEND:VEVENT\n"+
+			"BEGIN:VEVENT\nUID:dup\nDTSTAMP:20261001T000000Z\nDTSTART:20261117T020000Z\nSUMMARY:dup2\nEND:VEVENT\n"+
+			"END:VCALENDAR\n"))
+	want = append([]string{"dup"}, want...)
+
+	svc, _ := newTestService(fake, allow...)
+	_, out, err := svc.listEvents(context.Background(), nil, ListEventsArgs{
+		Start: "2026-11-17T00:00:00Z",
+		End:   "2026-11-18T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("listEvents: %v (one failing calendar must not fail the call)", err)
+	}
+	var got []string
+	for _, e := range out.Events {
+		got = append(got, e.Title)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("events = %v, want %v", got, want)
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	if len(out.Warnings) != 2 || !strings.Contains(joined, `calendar "Cal5" could not be queried`) || !strings.Contains(joined, "more than one main event") {
+		t.Errorf("warnings = %q, want one about Cal5 and one about the duplicate master", out.Warnings)
+	}
+}
+
+func TestListEvents_AllCalendarsFailingIsAnError(t *testing.T) {
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}},
+		fetchErrs: map[string]error{"/1/calendars/home/": errors.New("503 Service Unavailable")},
+	}
+	svc, _ := newTestService(fake, "Home")
+	_, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"})
+	if err == nil {
+		t.Errorf("listEvents succeeded with every calendar failing; want an error")
+	}
+}
+
+func TestListEvents_AuthErrorOnOneCalendarIsRetried(t *testing.T) {
+	fake := &fakeClient{
+		calendars: []icloud.Calendar{{Path: "/1/calendars/a/", Name: "A"}, {Path: "/1/calendars/b/", Name: "B"}},
+		fetchErrs: map[string]error{"/1/calendars/b/": fmt.Errorf("icloud: querying: %w", icloud.ErrUnauthorized)},
+	}
+	svc, connects := newTestService(fake, "A", "B")
+	_, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-11-17T00:00:00Z", End: "2026-11-18T00:00:00Z"})
+	if !errors.Is(err, icloud.ErrUnauthorized) || len(*connects) != 2 {
+		t.Errorf("err=%v connects=%d, want ErrUnauthorized after one refreshed retry", err, len(*connects))
+	}
+}
+
+// fakeCredStore is a credentialSource returning the same pointer until
+// invalidated.
+type fakeCredStore struct {
+	mu          sync.Mutex
+	cached      *credentials.Credentials
+	loads       int
+	invalidates int
+}
+
+func (f *fakeCredStore) Load(context.Context) (*credentials.Credentials, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cached == nil {
+		f.loads++
+		f.cached = &credentials.Credentials{AppleID: "a@example.com", AppSpecificPassword: "pw"}
+	}
+	return f.cached, nil
+}
+
+func (f *fakeCredStore) Invalidate() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invalidates++
+	f.cached = nil
+}
+
+func TestStoreConnector_ReusesClientUntilRefresh(t *testing.T) {
+	store := &fakeCredStore{}
+	built := 0
+	connect := storeConnector(store, func(string, string) (*fakeClient, error) {
+		built++
+		return &fakeClient{}, nil
+	})
+	ctx := context.Background()
+
+	a, _ := connect(ctx, false)
+	b, _ := connect(ctx, false)
+	if a != b || built != 1 {
+		t.Errorf("two plain connects built %d clients (same=%v), want one reused client", built, a == b)
+	}
+	c, _ := connect(ctx, true)
+	if c == a || built != 2 || store.invalidates != 1 {
+		t.Errorf("refresh: built=%d invalidates=%d same=%v, want a new client after invalidation", built, store.invalidates, c == a)
+	}
+	d, _ := connect(ctx, false)
+	if d != c || built != 2 {
+		t.Errorf("connect after refresh built %d clients, want the refreshed client reused", built)
 	}
 }

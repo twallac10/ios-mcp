@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	ical "github.com/emersion/go-ical"
@@ -32,8 +33,20 @@ type Calendar struct {
 // Client talks to iCloud's CalDAV server, authenticated via HTTP Basic Auth
 // with an Apple ID and an app-specific password (iCloud doesn't support
 // OAuth for CalDAV).
+//
+// A Client is safe for concurrent use, and is meant to be reused for as
+// long as its credentials are: it caches calendar discovery (see
+// ListCalendars).
 type Client struct {
 	dav *caldav.Client
+
+	// homeSet caches the account's calendar-home-set href, found via two
+	// discovery round trips (current-user-principal, then
+	// calendar-home-set) that give the same answer for the life of the
+	// account — so a warm Function instance doesn't repeat them on every
+	// MCP tool call, mirroring credentials.Store's cache.
+	mu      sync.Mutex
+	homeSet string
 }
 
 // ErrUnauthorized is returned (wrapped) by every Client method when iCloud
@@ -86,17 +99,21 @@ func newClient(httpClient webdav.HTTPClient, endpoint, appleID, appSpecificPassw
 
 // ListCalendars returns every calendar in the account's calendar home set,
 // unfiltered — callers apply the configured allowlist themselves.
+//
+// The home set's location is discovered once per Client and cached; the
+// calendar list itself is re-fetched on every call (one round trip), since
+// the user may add or remove calendars at any time.
 func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
-	principal, err := c.dav.FindCurrentUserPrincipal(ctx)
+	homeSet, err := c.calendarHomeSet(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("icloud: finding current user principal: %w", err)
-	}
-	homeSet, err := c.dav.FindCalendarHomeSet(ctx, principal)
-	if err != nil {
-		return nil, fmt.Errorf("icloud: finding calendar home set: %w", err)
+		return nil, err
 	}
 	cals, err := c.dav.FindCalendars(ctx, homeSet)
 	if err != nil {
+		// Rediscover next time, in case the cached home set is what's wrong.
+		c.mu.Lock()
+		c.homeSet = ""
+		c.mu.Unlock()
 		return nil, fmt.Errorf("icloud: listing calendars: %w", err)
 	}
 
@@ -105,6 +122,27 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 		out = append(out, Calendar{Path: cal.Path, Name: cal.Name})
 	}
 	return out, nil
+}
+
+// calendarHomeSet returns the cached calendar-home-set href, discovering
+// and caching it first if needed. Only success is cached.
+func (c *Client) calendarHomeSet(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.homeSet != "" {
+		return c.homeSet, nil
+	}
+	principal, err := c.dav.FindCurrentUserPrincipal(ctx)
+	if err != nil {
+		return "", fmt.Errorf("icloud: finding current user principal: %w", err)
+	}
+	homeSet, err := c.dav.FindCalendarHomeSet(ctx, principal)
+	if err != nil {
+		return "", fmt.Errorf("icloud: finding calendar home set: %w", err)
+	}
+	c.homeSet = homeSet
+	return homeSet, nil
 }
 
 // FetchObjects runs a CalDAV time-range REPORT against one calendar,

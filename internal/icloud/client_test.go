@@ -199,3 +199,77 @@ func TestClient_Unauthorized(t *testing.T) {
 		t.Fatalf("test premise: error text %q should contain 401", err)
 	}
 }
+
+// discoveryCalDAV answers the three calendar-discovery PROPFINDs, counting
+// each kind.
+type discoveryCalDAV struct {
+	mu                                      sync.Mutex
+	principalCalls, homeSetCalls, listCalls int
+}
+
+func (f *discoveryCalDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Method != "PROPFIND" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body string
+	switch r.URL.Path {
+	case "", "/":
+		f.principalCalls++
+		body = `<d:response><d:href>/</d:href><d:propstat><d:prop>
+<d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`
+	case "/principal/":
+		f.homeSetCalls++
+		body = `<d:response><d:href>/principal/</d:href><d:propstat><d:prop>
+<c:calendar-home-set><d:href>/cals/</d:href></c:calendar-home-set>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`
+	case "/cals/":
+		f.listCalls++
+		body = `<d:response><d:href>/cals/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/></d:resourcetype>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+<d:response><d:href>/cals/home/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+<d:displayname>Home</d:displayname>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">`+body+`</d:multistatus>`)
+}
+
+func TestListCalendars_CachesDiscovery(t *testing.T) {
+	fake := &discoveryCalDAV{}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	c, err := newClient(srv.Client(), srv.URL, "user@example.com", "pw")
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		cals, err := c.ListCalendars(context.Background())
+		if err != nil {
+			t.Fatalf("ListCalendars #%d: %v", i+1, err)
+		}
+		if len(cals) != 1 || cals[0].Path != "/cals/home/" || cals[0].Name != "Home" {
+			t.Fatalf("ListCalendars #%d = %+v, want the Home calendar", i+1, cals)
+		}
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.principalCalls != 1 || fake.homeSetCalls != 1 {
+		t.Errorf("discovery ran principal=%d home-set=%d times over two calls, want once each", fake.principalCalls, fake.homeSetCalls)
+	}
+	if fake.listCalls != 2 {
+		t.Errorf("calendar list fetched %d times, want 2 (it isn't cached)", fake.listCalls)
+	}
+}

@@ -27,6 +27,11 @@ type Instance struct {
 	// (the original, as-scheduled start time of the slot — RFC 5545's
 	// RECURRENCE-ID). Nil for a non-recurring event.
 	RecurrenceID *time.Time
+	// TZIDFallback is set to the raw TZID when one of this event's
+	// date-times carried a TZID that couldn't be resolved to a real time
+	// zone and was interpreted in the default location instead (see
+	// resolveTZID), so Start/End may be wrong. Empty normally.
+	TZIDFallback string
 }
 
 // expansionPad widens the window used to generate candidate occurrences
@@ -37,11 +42,44 @@ type Instance struct {
 // generator was never asked about that slot at all.
 const expansionPad = 48 * time.Hour
 
-// ExpandEvents turns the raw VEVENT components belonging to a single CalDAV
+// Expansion is the result of expanding one CalDAV calendar object.
+type Expansion struct {
+	Instances []Instance
+	// IgnoredMasters counts VEVENTs in the object that, like the series
+	// master, have no RECURRENCE-ID but came after it, and so were ignored:
+	// one calendar object should hold exactly one such VEVENT (RFC 4791
+	// section 4.1), so only the first is used.
+	IgnoredMasters int
+	// FallbackTZIDs lists, once each, TZIDs in the object that are neither
+	// IANA names nor known Windows zone IDs, and were therefore interpreted
+	// in the default location (see resolveTZID). Times in affected
+	// instances may be wrong; each such Instance has TZIDFallback set.
+	FallbackTZIDs []string
+}
+
+// window is the half-open time range [start, end) instances must overlap,
+// or, if unbounded, no restriction at all (see SingleEvent).
+type window struct {
+	start, end time.Time
+	unbounded  bool
+}
+
+func (w window) includes(start, end time.Time) bool {
+	return w.unbounded || overlaps(start, end, w.start, w.end)
+}
+
+// ExpandEvents is Expand, returning only the instances.
+func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowStart, windowEnd time.Time, loc *time.Location) ([]Instance, error) {
+	x, err := Expand(calendarPath, objectPath, events, windowStart, windowEnd, loc)
+	return x.Instances, err
+}
+
+// Expand turns the raw VEVENT components belonging to a single CalDAV
 // calendar object — a recurring master plus zero or more RECURRENCE-ID
 // overrides sharing its UID, or a single non-recurring VEVENT — into
 // concrete Instances overlapping the half-open window [windowStart,
-// windowEnd).
+// windowEnd), along with diagnostics about anything it had to guess at or
+// ignore.
 //
 // Recurrence (RRULE/EXDATE, and RECURRENCE-ID overrides) is expanded here,
 // in server code, deliberately: iCloud's server-side expansion
@@ -54,15 +92,26 @@ const expansionPad = 48 * time.Hour
 // on rather than fail the whole listing. Known real-world quirks are
 // tolerated rather than treated as errors: multi-value EXDATE/RDATE
 // properties, and TZIDs that aren't IANA names (see resolveTZID).
-func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowStart, windowEnd time.Time, loc *time.Location) ([]Instance, error) {
+func Expand(calendarPath, objectPath string, events []ical.Event, windowStart, windowEnd time.Time, loc *time.Location) (Expansion, error) {
+	return expand(calendarPath, objectPath, events, window{start: windowStart, end: windowEnd}, loc)
+}
+
+// SingleEvent is Expand with no time window, for looking up a known
+// non-recurring event wherever in time it falls: the object's non-recurring
+// VEVENT (unless cancelled) is returned regardless of its date. A recurring
+// series has unboundedly many occurrences, so for one only standalone
+// overrides with no master are returned; expand a series with Expand.
+func SingleEvent(calendarPath, objectPath string, events []ical.Event, loc *time.Location) (Expansion, error) {
+	return expand(calendarPath, objectPath, events, window{unbounded: true}, loc)
+}
+
+func expand(calendarPath, objectPath string, events []ical.Event, win window, loc *time.Location) (Expansion, error) {
+	var x Expansion
 	if len(events) == 0 {
-		return nil, nil
+		return x, nil
 	}
 
-	type overrideEntry struct {
-		recurrenceID time.Time
-		event        *ical.Event
-	}
+	x.FallbackTZIDs = fallbackTZIDs(events)
 
 	var master *ical.Event
 	overridesByKey := map[int64]overrideEntry{}
@@ -71,11 +120,13 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 		if prop := e.Props.Get(ical.PropRecurrenceID); prop != nil {
 			rid, err := propDateTime(prop, loc)
 			if err != nil {
-				return nil, fmt.Errorf("icloud: parsing RECURRENCE-ID: %w", err)
+				return Expansion{}, fmt.Errorf("icloud: parsing RECURRENCE-ID: %w", err)
 			}
 			overridesByKey[rid.UTC().Unix()] = overrideEntry{recurrenceID: rid, event: e}
 		} else if master == nil {
 			master = e
+		} else {
+			x.IgnoredMasters++
 		}
 	}
 
@@ -83,57 +134,56 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 		// Every VEVENT here is an override with no master in sight (e.g. the
 		// master was deleted but an exception survived server-side). Treat
 		// each override as its own standalone instance.
-		var out []Instance
 		for _, entry := range overridesByKey {
-			if isCancelled(entry.event) {
-				continue
-			}
-			rid := entry.recurrenceID
-			inst, err := instanceFromEvent(calendarPath, objectPath, entry.event, &rid, loc)
+			inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, entry.recurrenceID, win, loc)
 			if err != nil {
-				return nil, err
+				return Expansion{}, err
 			}
-			if overlaps(inst.Start, inst.End, windowStart, windowEnd) {
-				out = append(out, inst)
+			if ok {
+				x.Instances = append(x.Instances, inst)
 			}
 		}
-		sortInstances(out)
-		return out, nil
+		sortInstances(x.Instances)
+		return x, nil
+	}
+
+	// The organizer cancelled the event, or the entire series. Checked
+	// before anything else about the master is parsed, so a cancelled
+	// series is dropped even if its RRULE (say) wouldn't parse.
+	if isCancelled(master) {
+		return x, nil
 	}
 
 	masterStart, err := eventStart(master, loc)
 	if err != nil {
-		return nil, fmt.Errorf("icloud: parsing master DTSTART: %w", err)
+		return Expansion{}, fmt.Errorf("icloud: parsing master DTSTART: %w", err)
 	}
 
 	ruleSet, err := recurrenceSet(master, masterStart, loc)
 	if err != nil {
-		return nil, fmt.Errorf("icloud: parsing recurrence rule: %w", err)
+		return Expansion{}, fmt.Errorf("icloud: parsing recurrence rule: %w", err)
 	}
 
 	if ruleSet == nil {
-		// Not a recurring series: a single instance, unless cancelled.
-		if isCancelled(master) {
-			return nil, nil
-		}
+		// Not a recurring series: a single instance.
 		inst, err := instanceFromEvent(calendarPath, objectPath, master, nil, loc)
 		if err != nil {
-			return nil, err
+			return Expansion{}, err
 		}
-		if overlaps(inst.Start, inst.End, windowStart, windowEnd) {
-			return []Instance{inst}, nil
+		if win.includes(inst.Start, inst.End) {
+			x.Instances = []Instance{inst}
 		}
-		return nil, nil
+		return x, nil
 	}
 
-	// The organizer cancelled the entire series.
-	if isCancelled(master) {
-		return nil, nil
+	if win.unbounded {
+		// An unbounded window can't enumerate a recurring series.
+		return x, nil
 	}
 
 	masterEnd, err := eventEnd(master, masterStart, loc)
 	if err != nil {
-		return nil, fmt.Errorf("icloud: parsing master DTEND: %w", err)
+		return Expansion{}, fmt.Errorf("icloud: parsing master DTEND: %w", err)
 	}
 	duration := masterEnd.Sub(masterStart)
 	allDay := isAllDay(master)
@@ -151,37 +201,34 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 	masterTitle := textProp(master, ical.PropSummary)
 	masterLocation := textProp(master, ical.PropLocation)
 	masterNotes := textProp(master, ical.PropDescription)
+	masterTZIDFallback := eventFallbackTZID(master)
 
 	// Between matches on occurrence *start*, so reach back by the event's
 	// own length too: an occurrence that started before the window but is
 	// still running inside it must be generated to be considered at all.
-	occurrences := ruleSet.Between(windowStart.Add(-(expansionPad + duration)), windowEnd.Add(expansionPad), true)
+	occurrences := ruleSet.Between(win.start.Add(-(expansionPad + duration)), win.end.Add(expansionPad), true)
 
 	consumed := map[int64]bool{}
-	var out []Instance
 	for _, occStart := range occurrences {
 		key := occStart.UTC().Unix()
 		rid := occStart
 
 		if entry, ok := overridesByKey[key]; ok {
 			consumed[key] = true
-			if isCancelled(entry.event) {
-				continue // this occurrence was deleted from the series
-			}
-			inst, err := instanceFromEvent(calendarPath, objectPath, entry.event, &rid, loc)
+			inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, rid, win, loc)
 			if err != nil {
-				return nil, err
+				return Expansion{}, err
 			}
-			if overlaps(inst.Start, inst.End, windowStart, windowEnd) {
-				out = append(out, inst)
+			if ok {
+				x.Instances = append(x.Instances, inst)
 			}
 			continue
 		}
 
 		start := occStart
 		end := occurrenceEnd(occStart)
-		if overlaps(start, end, windowStart, windowEnd) {
-			out = append(out, Instance{
+		if win.includes(start, end) {
+			x.Instances = append(x.Instances, Instance{
 				UID:          masterUID,
 				ObjectPath:   objectPath,
 				CalendarPath: calendarPath,
@@ -193,6 +240,7 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 				Notes:        masterNotes,
 				Recurring:    true,
 				RecurrenceID: &rid,
+				TZIDFallback: masterTZIDFallback,
 			})
 		}
 	}
@@ -202,21 +250,40 @@ func ExpandEvents(calendarPath, objectPath string, events []ical.Event, windowSt
 	// slot falls well outside [windowStart, windowEnd)) still needs
 	// consideration using its own, possibly-moved start time.
 	for key, entry := range overridesByKey {
-		if consumed[key] || isCancelled(entry.event) {
+		if consumed[key] {
 			continue
 		}
-		rid := entry.recurrenceID
-		inst, err := instanceFromEvent(calendarPath, objectPath, entry.event, &rid, loc)
+		inst, ok, err := overrideInstance(calendarPath, objectPath, entry.event, entry.recurrenceID, win, loc)
 		if err != nil {
-			return nil, err
+			return Expansion{}, err
 		}
-		if overlaps(inst.Start, inst.End, windowStart, windowEnd) {
-			out = append(out, inst)
+		if ok {
+			x.Instances = append(x.Instances, inst)
 		}
 	}
 
-	sortInstances(out)
-	return out, nil
+	sortInstances(x.Instances)
+	return x, nil
+}
+
+// overrideEntry is a RECURRENCE-ID override VEVENT and its parsed
+// RECURRENCE-ID.
+type overrideEntry struct {
+	recurrenceID time.Time
+	event        *ical.Event
+}
+
+// overrideInstance turns a RECURRENCE-ID override VEVENT into the Instance
+// for slot rid, reporting false if it was cancelled or falls outside win.
+func overrideInstance(calendarPath, objectPath string, e *ical.Event, rid time.Time, win window, loc *time.Location) (Instance, bool, error) {
+	if isCancelled(e) {
+		return Instance{}, false, nil // this occurrence was deleted from the series
+	}
+	inst, err := instanceFromEvent(calendarPath, objectPath, e, &rid, loc)
+	if err != nil {
+		return Instance{}, false, err
+	}
+	return inst, win.includes(inst.Start, inst.End), nil
 }
 
 func instanceFromEvent(calendarPath, objectPath string, e *ical.Event, recurrenceID *time.Time, loc *time.Location) (Instance, error) {
@@ -240,6 +307,7 @@ func instanceFromEvent(calendarPath, objectPath string, e *ical.Event, recurrenc
 		Notes:        textProp(e, ical.PropDescription),
 		Recurring:    recurrenceID != nil,
 		RecurrenceID: recurrenceID,
+		TZIDFallback: eventFallbackTZID(e),
 	}, nil
 }
 
@@ -438,18 +506,81 @@ var windowsZones = map[string]string{
 // location: a known Windows zone ID's IANA equivalent, else fallback (the
 // server's configured default zone). The fallback keeps one oddly-labelled
 // event from breaking a listing; a structurally valid local time in the
-// user's own zone is the most likely intent for an unknown label.
+// user's own zone is the most likely intent for an unknown label. It is a
+// guess, though, so it's reported: see Expansion.FallbackTZIDs and
+// Instance.TZIDFallback.
 func resolveTZID(tzid string, fallback *time.Location) *time.Location {
-	name := strings.Trim(strings.TrimSpace(tzid), `"`)
-	if iana, ok := windowsZones[name]; ok {
-		if loc, err := time.LoadLocation(iana); err == nil {
-			return loc
-		}
+	if loc, ok := windowsZone(tzid); ok {
+		return loc
 	}
 	if fallback == nil {
 		return time.UTC
 	}
 	return fallback
+}
+
+func windowsZone(tzid string) (*time.Location, bool) {
+	name := strings.Trim(strings.TrimSpace(tzid), `"`)
+	if iana, ok := windowsZones[name]; ok {
+		if loc, err := time.LoadLocation(iana); err == nil {
+			return loc, true
+		}
+	}
+	return nil, false
+}
+
+// tzidFallsBack reports whether propDateTime would interpret a date-time
+// with this TZID in the fallback location, i.e. resolveTZID had to guess.
+func tzidFallsBack(tzid string) bool {
+	if tzid == "" {
+		return false
+	}
+	if _, err := time.LoadLocation(tzid); err == nil {
+		return false
+	}
+	_, ok := windowsZone(tzid)
+	return !ok
+}
+
+// dateTimeProps are the VEVENT properties propDateTime interprets.
+var dateTimeProps = []string{
+	ical.PropDateTimeStart,
+	ical.PropDateTimeEnd,
+	ical.PropRecurrenceID,
+	ical.PropExceptionDates,
+	ical.PropRecurrenceDates,
+}
+
+// eventFallbackTZID returns the first TZID among e's date-time properties
+// that resolveTZID can only guess at, or "".
+func eventFallbackTZID(e *ical.Event) string {
+	for _, name := range dateTimeProps {
+		for _, prop := range e.Props.Values(name) {
+			if tzid := prop.Params.Get(ical.PropTimezoneID); tzidFallsBack(tzid) {
+				return tzid
+			}
+		}
+	}
+	return ""
+}
+
+// fallbackTZIDs returns, once each, every TZID in events that resolveTZID
+// can only guess at.
+func fallbackTZIDs(events []ical.Event) []string {
+	var out []string
+	seen := map[string]bool{}
+	for i := range events {
+		for _, name := range dateTimeProps {
+			for _, prop := range events[i].Props.Values(name) {
+				tzid := prop.Params.Get(ical.PropTimezoneID)
+				if tzidFallsBack(tzid) && !seen[tzid] {
+					seen[tzid] = true
+					out = append(out, tzid)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // calendarDaysBetween counts the calendar days from start's date to end's
@@ -494,10 +625,14 @@ func textProp(e *ical.Event, name string) string {
 	return v
 }
 
-// overlaps reports whether the half-open interval [aStart, aEnd) intersects
-// [bStart, bEnd).
+// overlaps reports whether the event [aStart, aEnd) intersects the
+// half-open window [bStart, bEnd). A zero-duration event (aStart == aEnd,
+// e.g. a timed VEVENT with neither DTEND nor DURATION) is an instant, and
+// is included when bStart <= aStart < bEnd — so one exactly at the
+// window's inclusive start counts, matching RFC 4791 section 9.9's
+// time-range test for such events.
 func overlaps(aStart, aEnd, bStart, bEnd time.Time) bool {
-	return aStart.Before(bEnd) && aEnd.After(bStart)
+	return aStart.Before(bEnd) && (aEnd.After(bStart) || !aStart.Before(bStart))
 }
 
 func sortInstances(instances []Instance) {
