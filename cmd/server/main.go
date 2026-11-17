@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -75,7 +76,12 @@ func main() {
 
 	log.Info("starting iCloud Calendar MCP server",
 		"port", port, "functions_customhandler_port_env", envPort, "calendar_count", len(cfg.CalendarAllowlist))
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Error("server exited", "error", err)
 		os.Exit(1)
 	}

@@ -198,7 +198,7 @@ func (svc *Service) listCalendars(ctx context.Context, _ *mcp.CallToolRequest, _
 type ListEventsArgs struct {
 	Calendar string `json:"calendar,omitempty" jsonschema:"Restrict results to this calendar's exact name (from list_calendars). Omit to search every allow-listed calendar."`
 	Start    string `json:"start" jsonschema:"Inclusive start of the time window, as a full RFC3339 timestamp with a UTC offset, e.g. 2026-11-17T00:00:00-06:00."`
-	End      string `json:"end" jsonschema:"Exclusive end of the time window, as a full RFC3339 timestamp with a UTC offset."`
+	End      string `json:"end" jsonschema:"Exclusive end of the time window, as a full RFC3339 timestamp with a UTC offset. At most 366 days after start."`
 }
 
 type EventOut struct {
@@ -230,6 +230,11 @@ type ListEventsResult struct {
 	Warnings []string `json:"warnings,omitempty" jsonschema:"What was left out of events and why (e.g. a calendar that failed to load). Non-empty means the listing is incomplete; see incomplete."`
 }
 
+// maxListWindow caps list_events' window, so one call can't expand e.g. a
+// daily series across decades into a response of tens of thousands of
+// occurrences.
+const maxListWindow = 366 * 24 * time.Hour
+
 // maxConcurrentCalendarFetches caps how many calendars list_events queries
 // at once: enough to overlap most of the latency for a typical account,
 // few enough not to hammer one account's iCloud quota (or get throttled)
@@ -256,6 +261,9 @@ func (svc *Service) listEvents(ctx context.Context, _ *mcp.CallToolRequest, args
 	}
 	if !end.After(start) {
 		return nil, ListEventsResult{}, fmt.Errorf("end (%s) must be after start (%s)", args.End, args.Start)
+	}
+	if end.Sub(start) > maxListWindow {
+		return nil, ListEventsResult{}, fmt.Errorf("the time window is too long (at most %d days); split it into smaller windows", int(maxListWindow/(24*time.Hour)))
 	}
 
 	if args.Calendar != "" && !svc.cfg.IsCalendarAllowed(args.Calendar) {

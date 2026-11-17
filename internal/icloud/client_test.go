@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -107,6 +108,17 @@ func (f *fakeCalDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     </d:propstat>
   </d:response>
 </d:multistatus>`)
+	case r.Method == "PROPFIND" && (r.URL.Path == "/" || r.URL.Path == "/principal/"):
+		// Calendar discovery, which every Client method runs first.
+		prop := `<d:current-user-principal><d:href>/principal/</d:href></d:current-user-principal>`
+		if r.URL.Path == "/principal/" {
+			prop = `<c:calendar-home-set><d:href>/cals/</d:href></c:calendar-home-set>`
+		}
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMultiStatus)
+		io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>`+r.URL.Path+`</d:href>
+<d:propstat><d:prop>`+prop+`</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`)
 	case r.Method == http.MethodPut:
 		if f.putBodies == nil {
 			f.putBodies = map[string]string{}
@@ -301,5 +313,87 @@ func TestListCalendars_RediscoversHomeSetAfterTTL(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.principalCalls != 2 || fake.homeSetCalls != 2 {
 		t.Errorf("discovery ran principal=%d home-set=%d times, want twice each (initially, then after the TTL)", fake.principalCalls, fake.homeSetCalls)
+	}
+}
+
+// partitionCalDAV is a discovery server whose calendar home set is an
+// absolute URL on another host (as iCloud's is, on pNN-caldav.icloud.com).
+type partitionCalDAV struct {
+	homeURL string
+}
+
+func (f *partitionCalDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var prop string
+	switch r.URL.Path {
+	case "/":
+		prop = `<d:current-user-principal><d:href>/123/principal/</d:href></d:current-user-principal>`
+	case "/123/principal/":
+		prop = `<c:calendar-home-set><d:href>` + f.homeURL + `</d:href></c:calendar-home-set>`
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response><d:href>`+r.URL.Path+`</d:href>
+<d:propstat><d:prop>`+prop+`</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`)
+}
+
+func TestClient_UsesHomeSetHost(t *testing.T) {
+	home := &discoveryCalDAV{}
+	homeSrv := httptest.NewServer(home)
+	t.Cleanup(homeSrv.Close)
+	disc := httptest.NewServer(&partitionCalDAV{homeURL: homeSrv.URL + "/cals/"})
+	t.Cleanup(disc.Close)
+
+	c, err := newClient(http.DefaultClient, disc.URL, "user@example.com", "pw")
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	c.trustHost = func(*url.URL) bool { return true }
+
+	cals, err := c.ListCalendars(context.Background())
+	if err != nil {
+		t.Fatalf("ListCalendars: %v", err)
+	}
+	if len(cals) != 1 || cals[0].Path != "/cals/home/" {
+		t.Fatalf("ListCalendars = %+v, want the Home calendar from the home-set host", cals)
+	}
+	home.mu.Lock()
+	defer home.mu.Unlock()
+	if home.listCalls != 1 {
+		t.Errorf("home-set host got %d calendar listings, want 1", home.listCalls)
+	}
+}
+
+func TestClient_RefusesUntrustedHomeSetHost(t *testing.T) {
+	other := httptest.NewServer(&discoveryCalDAV{})
+	t.Cleanup(other.Close)
+	disc := httptest.NewServer(&partitionCalDAV{homeURL: other.URL + "/cals/"})
+	t.Cleanup(disc.Close)
+
+	c, err := newClient(http.DefaultClient, disc.URL, "user@example.com", "pw")
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	// Default trustHost: a plain-HTTP, non-icloud.com host is refused.
+	if _, err := c.ListCalendars(context.Background()); err == nil || !strings.Contains(err.Error(), "unexpected host") {
+		t.Fatalf("ListCalendars = %v, want an unexpected-host error", err)
+	}
+}
+
+func TestIsICloudHost(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"https://p42-caldav.icloud.com:443/1/calendars/": true,
+		"https://caldav.icloud.com/":                     true,
+		"http://p42-caldav.icloud.com/":                  false,
+		"https://evilicloud.com/":                        false,
+		"https://icloud.com.evil.example/":               false,
+	} {
+		u, _ := url.Parse(raw)
+		if got := isICloudHost(u); got != want {
+			t.Errorf("isICloudHost(%s) = %v, want %v", raw, got, want)
+		}
 	}
 }

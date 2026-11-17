@@ -117,3 +117,14 @@ func TestSaveWritesJSONAndUpdatesCache(t *testing.T) {
 		t.Fatalf("GetSecret called %d times, want 0 (Save should have primed the cache)", fake.getCalls)
 	}
 }
+
+func TestLoadRejectsIncompleteSecret(t *testing.T) {
+	val := `{"apple_id":"me@example.com"}`
+	store := &Store{client: &fakeSecretsClient{getValue: &val}}
+	if _, err := store.Load(context.Background()); err == nil {
+		t.Fatalf("Load() of a secret with no password succeeded, want an error")
+	}
+	if store.cached != nil {
+		t.Errorf("an incomplete secret was cached")
+	}
+}
