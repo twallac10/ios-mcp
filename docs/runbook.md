@@ -213,11 +213,29 @@ runs in Azure is exactly what you tested locally.
   2. Add a TXT record at `asuid.<subdomain>` with the Function App's domain
      ownership token (`az resource show --ids <site-id> --query
      properties.customDomainVerificationId`).
-  3. CNAME `<subdomain>` → `<default-hostname>`.
+  3. CNAME `<subdomain>` → `<default-hostname>`. If DNS is on Cloudflare,
+     the CNAME must be **DNS only** (grey cloud) — proxied, Azure can't
+     validate the hostname or issue the managed certificate.
   4. `az functionapp config hostname add --name <app> -g <rg> --hostname
      <subdomain>` once DNS resolves from a public resolver.
-  5. `az functionapp config ssl create` + `ssl bind` for a free managed
-     certificate.
+  5. `az functionapp config ssl create --name <app> -g <rg> --hostname
+     <subdomain>` for a free managed certificate, then `az functionapp
+     config ssl bind --name <app> -g <rg> --certificate-thumbprint
+     <thumbprint> --ssl-type SNI`. On Flex Consumption, Azure CLI (seen
+     with 2.90) is misleading here:
+     - `ssl create` prints a JSON-decode traceback and "creation in
+       progress", but it **did** succeed — don't re-run it.
+     - The certificate is *site-scoped*, so `az webapp config ssl show`
+       and `az resource list --resource-type Microsoft.Web/certificates`
+       report it as not found. Read it (and its thumbprint, once issued
+       — a few minutes) from the site instead:
+
+       ```bash
+       az rest --method get --url "https://management.azure.com/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Web/sites/<app>/certificates/<subdomain>?api-version=2025-05-01" \
+         --query "properties.{thumbprint:thumbprint,expires:expirationDate}"
+       ```
+     - For the first minute or two after binding, some HTTPS requests to
+       the custom domain fail to connect while the binding propagates.
   6. Add the custom-domain MCP URL as a second `identifierUris` entry on
      the server App Registration, and to Easy Auth's `allowedAudiences`
      (next step).

@@ -2,3 +2,8 @@ local.settings.json
 ios-mcp-server
 /bin/
 .worktrees
+
+# Deploy package (runbook Part 2)
+/publish/
+/publish.zip
+ios-mcp.zip
