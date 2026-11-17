@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -36,12 +37,11 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Print("Apple ID (email): ")
-	appleID, err := reader.ReadString('\n')
+	appleID, err := readLine(reader)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reading Apple ID: %v\n", err)
 		os.Exit(1)
 	}
-	appleID = strings.TrimSpace(appleID)
 
 	// Typed into the running prompt (never a command-line argument), so it
 	// never lands in shell history, argv, or any log — unlike
@@ -83,6 +83,15 @@ func readSecret(reader *bufio.Reader) (string, error) {
 		fmt.Println()
 		return strings.TrimSpace(string(b)), err
 	}
+	return readLine(reader)
+}
+
+// readLine reads one trimmed line, accepting a final line with no trailing
+// newline (e.g. piped input from printf without "\n").
+func readLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
+	if err == io.EOF && line != "" {
+		err = nil
+	}
 	return strings.TrimSpace(line), err
 }

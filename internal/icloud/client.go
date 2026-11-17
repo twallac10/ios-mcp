@@ -6,10 +6,12 @@ package icloud
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -38,16 +40,26 @@ type Calendar struct {
 // long as its credentials are: it caches calendar discovery (see
 // ListCalendars).
 type Client struct {
+	// http is the authenticated transport every request goes through.
+	http webdav.HTTPClient
+	// endpoint is the discovery endpoint (ServerURL in production).
+	endpoint *url.URL
+	// dav talks to endpoint; used only for discovery.
 	dav *caldav.Client
+	// trustHost reports whether credentials may be sent to a calendar
+	// home set on a host other than endpoint's (see discover).
+	trustHost func(*url.URL) bool
 
-	// homeSet caches the account's calendar-home-set href, found via two
-	// discovery round trips (current-user-principal, then
-	// calendar-home-set) that almost always give the same answer — so a
-	// warm Function instance doesn't repeat them on every MCP tool call,
-	// mirroring credentials.Store's cache. It's dropped on a failed calendar
-	// listing, and in any case after homeSetTTL (see calendarHomeSet).
+	// homeSet caches the account's calendar-home-set path, and homeDAV a
+	// client for the host it lives on, found via two discovery round trips
+	// (current-user-principal, then calendar-home-set) that almost always
+	// give the same answer — so a warm Function instance doesn't repeat
+	// them on every MCP tool call, mirroring credentials.Store's cache.
+	// They're dropped on a failed calendar listing, and in any case after
+	// homeSetTTL (see session).
 	mu        sync.Mutex
 	homeSet   string
+	homeDAV   *caldav.Client
 	homeSetAt time.Time
 	now       func() time.Time
 }
@@ -94,18 +106,34 @@ func (d unauthorizedDetector) Do(req *http.Request) (*http.Response, error) {
 // NewClient creates a Client authenticated as appleID using the given
 // app-specific password.
 func NewClient(appleID, appSpecificPassword string) (*Client, error) {
-	return newClient(http.DefaultClient, ServerURL, appleID, appSpecificPassword)
+	return newClient(&http.Client{Timeout: requestTimeout}, ServerURL, appleID, appSpecificPassword)
 }
+
+// requestTimeout bounds each HTTP request to iCloud, so a stalled
+// connection can't hang a tool call (http.DefaultClient has no timeout).
+const requestTimeout = 30 * time.Second
 
 // newClient is NewClient with an injectable transport and endpoint, for
 // tests against an httptest.Server.
 func newClient(httpClient webdav.HTTPClient, endpoint, appleID, appSpecificPassword string) (*Client, error) {
-	authed := webdav.HTTPClientWithBasicAuth(httpClient, appleID, appSpecificPassword)
-	dav, err := caldav.NewClient(unauthorizedDetector{next: authed}, endpoint)
+	authed := unauthorizedDetector{next: webdav.HTTPClientWithBasicAuth(httpClient, appleID, appSpecificPassword)}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("icloud: parsing CalDAV endpoint: %w", err)
+	}
+	dav, err := caldav.NewClient(authed, endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("icloud: creating CalDAV client: %w", err)
 	}
-	return &Client{dav: dav, now: time.Now}, nil
+	return &Client{http: authed, endpoint: u, dav: dav, trustHost: isICloudHost, now: time.Now}, nil
+}
+
+// isICloudHost reports whether u is an HTTPS URL on an icloud.com host,
+// e.g. the per-account partition host (https://p42-caldav.icloud.com)
+// iCloud hands out as a calendar home set.
+func isICloudHost(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	return u.Scheme == "https" && (host == "icloud.com" || strings.HasSuffix(host, ".icloud.com"))
 }
 
 // ListCalendars returns every calendar in the account's calendar home set,
@@ -115,15 +143,15 @@ func newClient(httpClient webdav.HTTPClient, endpoint, appleID, appSpecificPassw
 // to homeSetTTL); the calendar list itself is re-fetched on every call (one
 // round trip), since the user may add or remove calendars at any time.
 func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
-	homeSet, err := c.calendarHomeSet(ctx)
+	dav, homeSet, err := c.session(ctx)
 	if err != nil {
 		return nil, err
 	}
-	cals, err := c.dav.FindCalendars(ctx, homeSet)
+	cals, err := dav.FindCalendars(ctx, homeSet)
 	if err != nil {
 		// Rediscover next time, in case the cached home set is what's wrong.
 		c.mu.Lock()
-		c.homeSet = ""
+		c.homeSet, c.homeDAV = "", nil
 		c.mu.Unlock()
 		return nil, fmt.Errorf("icloud: listing calendars: %w", err)
 	}
@@ -135,26 +163,120 @@ func (c *Client) ListCalendars(ctx context.Context) ([]Calendar, error) {
 	return out, nil
 }
 
-// calendarHomeSet returns the cached calendar-home-set href, discovering
-// and caching it first if there is none or it's older than homeSetTTL.
-// Only success is cached.
-func (c *Client) calendarHomeSet(ctx context.Context) (string, error) {
+// session returns a CalDAV client for the host the account's calendars
+// live on, and the calendar-home-set path on it, discovering and caching
+// both first if there are none or they're older than homeSetTTL. Only
+// success is cached.
+//
+// iCloud answers discovery on caldav.icloud.com but returns the calendar
+// home set as an absolute URL on a per-account partition host (e.g.
+// https://p42-caldav.icloud.com:443/1234567/calendars/). go-webdav's
+// FindCalendarHomeSet keeps only that URL's path, so every later request
+// would go to the wrong host; this keeps the host too, and every calendar
+// request (listing, querying, fetching, creating) goes there.
+func (c *Client) session(ctx context.Context) (*caldav.Client, string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.homeSet != "" && c.now().Sub(c.homeSetAt) < homeSetTTL {
-		return c.homeSet, nil
+	if c.homeSet != "" && c.homeDAV != nil && c.now().Sub(c.homeSetAt) < homeSetTTL {
+		return c.homeDAV, c.homeSet, nil
 	}
+	dav, homeSet, err := c.discover(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	c.homeDAV, c.homeSet, c.homeSetAt = dav, homeSet, c.now()
+	return dav, homeSet, nil
+}
+
+func (c *Client) discover(ctx context.Context) (*caldav.Client, string, error) {
 	principal, err := c.dav.FindCurrentUserPrincipal(ctx)
 	if err != nil {
-		return "", fmt.Errorf("icloud: finding current user principal: %w", err)
+		return nil, "", fmt.Errorf("icloud: finding current user principal: %w", err)
 	}
-	homeSet, err := c.dav.FindCalendarHomeSet(ctx, principal)
+	principalURL := c.endpoint.ResolveReference(&url.URL{Path: principal})
+	href, err := c.findHomeSetHref(ctx, principalURL)
 	if err != nil {
-		return "", fmt.Errorf("icloud: finding calendar home set: %w", err)
+		return nil, "", fmt.Errorf("icloud: finding calendar home set: %w", err)
 	}
-	c.homeSet, c.homeSetAt = homeSet, c.now()
-	return homeSet, nil
+	home, err := principalURL.Parse(href)
+	if err != nil {
+		return nil, "", fmt.Errorf("icloud: finding calendar home set: unparseable href %q: %w", href, err)
+	}
+	if home.Path == "" {
+		home.Path = "/"
+	}
+
+	if strings.EqualFold(home.Host, c.endpoint.Host) && home.Scheme == c.endpoint.Scheme {
+		return c.dav, home.Path, nil
+	}
+	if !c.trustHost(home) {
+		return nil, "", fmt.Errorf("icloud: calendar home set is on unexpected host %q; refusing to send credentials there", home.Host)
+	}
+	dav, err := caldav.NewClient(c.http, (&url.URL{Scheme: home.Scheme, Host: home.Host, Path: "/"}).String())
+	if err != nil {
+		return nil, "", fmt.Errorf("icloud: creating CalDAV client for %q: %w", home.Host, err)
+	}
+	return dav, home.Path, nil
+}
+
+const homeSetPropfind = `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>`
+
+// homeSetMultistatus is the part of a PROPFIND calendar-home-set response
+// that findHomeSetHref reads.
+type homeSetMultistatus struct {
+	XMLName   xml.Name `xml:"DAV: multistatus"`
+	Responses []struct {
+		Propstats []struct {
+			Status string `xml:"DAV: status"`
+			Prop   struct {
+				HomeSet struct {
+					Hrefs []string `xml:"DAV: href"`
+				} `xml:"urn:ietf:params:xml:ns:caldav calendar-home-set"`
+			} `xml:"DAV: prop"`
+		} `xml:"DAV: propstat"`
+	} `xml:"DAV: response"`
+}
+
+// findHomeSetHref PROPFINDs principal's calendar-home-set and returns its
+// href exactly as the server gave it (possibly an absolute URL).
+func (c *Client) findHomeSetHref(ctx context.Context, principal *url.URL) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", principal.String(), strings.NewReader(homeSetPropfind))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
+	req.Header.Set("Depth", "0")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusMultiStatus {
+		return "", fmt.Errorf("PROPFIND %s: HTTP %d", principal.Path, resp.StatusCode)
+	}
+	var ms homeSetMultistatus
+	if err := xml.Unmarshal(body, &ms); err != nil {
+		return "", fmt.Errorf("decoding PROPFIND response: %w", err)
+	}
+	for _, r := range ms.Responses {
+		for _, ps := range r.Propstats {
+			if ps.Status != "" && !strings.Contains(ps.Status, " 200") {
+				continue
+			}
+			for _, h := range ps.Prop.HomeSet.Hrefs {
+				if h = strings.TrimSpace(h); h != "" {
+					return h, nil
+				}
+			}
+		}
+	}
+	return "", errors.New("no calendar-home-set in PROPFIND response")
 }
 
 // FetchObjects runs a CalDAV time-range REPORT against one calendar,
@@ -186,7 +308,11 @@ func (c *Client) FetchObjects(ctx context.Context, calendarPath string, start, e
 			},
 		},
 	}
-	objs, err := c.dav.QueryCalendar(ctx, calendarPath, query)
+	dav, _, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	objs, err := dav.QueryCalendar(ctx, calendarPath, query)
 	if err != nil {
 		return nil, fmt.Errorf("icloud: querying calendar %q: %w", calendarPath, err)
 	}
@@ -197,7 +323,11 @@ func (c *Client) FetchObjects(ctx context.Context, calendarPath string, start, e
 // get_event once the calendar + object path are known from a previously
 // returned event ID.
 func (c *Client) GetObject(ctx context.Context, objectPath string) (*caldav.CalendarObject, error) {
-	obj, err := c.dav.GetCalendarObject(ctx, objectPath)
+	dav, _, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := dav.GetCalendarObject(ctx, objectPath)
 	if err != nil {
 		return nil, fmt.Errorf("icloud: fetching calendar object %q: %w", objectPath, err)
 	}
@@ -246,8 +376,12 @@ func (c *Client) CreateEvent(ctx context.Context, calendarPath string, draft Eve
 	cal.Props.SetText(ical.PropVersion, "2.0")
 	cal.Children = append(cal.Children, event.Component)
 
+	dav, _, err := c.session(ctx)
+	if err != nil {
+		return Instance{}, err
+	}
 	objectPath := strings.TrimSuffix(calendarPath, "/") + "/" + draft.UID + ".ics"
-	if _, err := c.dav.PutCalendarObject(ctx, objectPath, cal); err != nil {
+	if _, err := dav.PutCalendarObject(ctx, objectPath, cal); err != nil {
 		return Instance{}, fmt.Errorf("icloud: creating event: %w", err)
 	}
 

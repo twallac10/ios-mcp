@@ -13,7 +13,8 @@ from Python to Go.
 - `list_calendars` — the allow-listed iCloud calendars
 - `list_events(calendar?, start, end)` — events in a time window, with
   recurring events already expanded into individual occurrences (one entry
-  per occurrence, not one per series)
+  per occurrence, not one per series); the window may span at most 366
+  days
 - `get_event(id)` — full detail for one event instance
 - `create_event(calendar, title, start, end, location?, notes?)` — create a
   single (non-recurring) event

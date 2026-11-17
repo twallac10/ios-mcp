@@ -849,3 +849,18 @@ func TestRegister_ListEventsSchemaFlagsIncompleteResults(t *testing.T) {
 	}
 	t.Fatal("list_events not registered")
 }
+
+func TestListEvents_RejectsOverlongWindow(t *testing.T) {
+	fake := &fakeClient{calendars: []icloud.Calendar{{Path: "/1/calendars/home/", Name: "Home"}}}
+	svc, connects := newTestService(fake, "Home")
+	_, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-01-01T00:00:00Z", End: "2036-01-01T00:00:00Z"})
+	if err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("listEvents over ten years = %v, want a window-too-long error", err)
+	}
+	if len(*connects) != 0 {
+		t.Errorf("listEvents connected to iCloud before rejecting the window")
+	}
+	if _, _, err := svc.listEvents(context.Background(), nil, ListEventsArgs{Start: "2026-01-01T00:00:00Z", End: "2027-01-01T00:00:00Z"}); err != nil {
+		t.Errorf("listEvents over one year = %v, want success", err)
+	}
+}

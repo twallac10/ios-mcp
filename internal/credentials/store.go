@@ -116,6 +116,9 @@ func (s *Store) fetch(ctx context.Context) (*Credentials, error) {
 	if err := json.Unmarshal([]byte(*resp.Value), &creds); err != nil {
 		return nil, fmt.Errorf("credentials: stored secret is not valid JSON: %w", err)
 	}
+	if creds.AppleID == "" || creds.AppSpecificPassword == "" {
+		return nil, fmt.Errorf("credentials: stored secret %q is missing apple_id or app_specific_password; re-run cmd/seed-credentials", SecretName)
+	}
 	return &creds, nil
 }
 
