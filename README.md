@@ -24,6 +24,28 @@ There is **no update or delete tool in v1**, by design — see "Notes" below.
 Only calendars on the configured allowlist (`ICLOUD_CALENDAR_ALLOWLIST`) are
 visible to any tool, including `list_calendars` itself.
 
+## Getting started
+
+Prerequisites: Go, the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
+(`az login` done), [Azure Functions Core
+Tools](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local),
+[Azurite](https://learn.microsoft.com/en-us/azure/storage/common/storage-install-azurite),
+an Azure subscription, and an Apple ID with an app-specific password.
+
+1. **Build and test**: `go build ./... && go test ./...` — no Azure or
+   iCloud access needed.
+2. **Provision Azure resources** (Function App, Storage, Key Vault,
+   Application Insights) — [runbook Part 1](docs/runbook.md#part-1-base-resources).
+3. **Seed the iCloud credential** into Key Vault — see [One-time iCloud
+   login](#one-time-icloud-login).
+4. **Smoke test locally** against the real vault with `func start` — see
+   [Local development](#local-development). Confirm `list_calendars` and
+   `list_events` return real data.
+5. **Build for Linux and deploy** — [runbook Part 2](docs/runbook.md#part-2-build-and-deploy-the-go-specific-part).
+6. **Set up Entra ID / Easy Auth and a custom domain** —
+   [runbook Part 3](docs/runbook.md#part-3-entra-id--easy-auth-identical-shape-to-concept2).
+7. **Connect Claude** — see [Connecting Claude](#connecting-claude).
+
 ## Architecture
 
 Two independent authentication layers, same shape as the Concept2 server:
