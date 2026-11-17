@@ -17,20 +17,94 @@ account.
   Vault's name — it goes into `local.settings.json` and the Function App's
   settings below.
 
-- [ ] **Seed the iCloud credential**: with `ICLOUD_KEY_VAULT_NAME` set to
-  the real vault name and `az login` completed, run
-  `go run ./cmd/seed-credentials` locally once. This runs as *your own*
-  signed-in identity, which needs secret **write** access on the vault
-  (e.g. `Key Vault Secrets Officer`, or vault owner/admin). It's the only
-  thing that ever writes the secret — the deployed Function App only reads
-  it (see the Managed Identity step below).
+  In the Function App wizard:
+  - On the Authentication tab, choose **Managed identity** rather than
+    secrets. The wizard creates one user-assigned identity
+    (`<app>-uami`) and grants it the host-storage, deployment-storage and
+    Application Insights roles, so no storage keys end up in app settings.
+    The same identity reads Key Vault (Part 2).
+  - **Secure unique default hostname** (on by default) gives the app a
+    hostname like `<app>-<hash>.<region>-01.azurewebsites.net` rather than
+    `<app>.azurewebsites.net`. Copy the real **Default domain** from the
+    app's Overview page; wherever this runbook says
+    `<default-hostname>`, use that value.
+
+  The Key Vault isn't part of the Function App wizard — create it
+  separately in the same resource group, with the **Azure role-based
+  access control** permission model (Part 2 grants access by role
+  assignment, not access policy).
+
+- [ ] **Grant yourself secret write access on the vault**: with the RBAC
+  permission model, creating the vault — or owning the subscription —
+  does *not* let you read or write its secrets. Assign yourself `Key Vault
+  Secrets Officer` scoped to the vault (or use the vault's Access control
+  (IAM) → Add role assignment in the portal):
+
+  ```bash
+  az role assignment create --role "Key Vault Secrets Officer" \
+    --assignee $(az ad signed-in-user show --query id -o tsv) \
+    --scope $(az keyvault show --name <vault-name> --query id -o tsv)
+  ```
+
+  Allow a minute or two for it to propagate; without it the seed step
+  below fails with `Forbidden`.
+
+- [ ] **Generate an iCloud app-specific password**: iCloud's CalDAV
+  endpoint won't accept your normal Apple Account password (or any OAuth
+  flow) — it needs an app-specific password.
+  1. Sign in at [account.apple.com](https://account.apple.com) →
+     **Sign-In and Security** → **App-Specific Passwords**. (Apple only
+     offers these once two-factor authentication is on for the account.)
+  2. Generate one with a recognizable label, e.g. `ios-mcp`, so you can
+     revoke exactly this one later.
+  3. Copy it immediately — it's shown once, in the form
+     `xxxx-xxxx-xxxx-xxxx`. Keep the hyphens. Don't save it anywhere else;
+     the next step puts it in Key Vault, and if you lose it before then,
+     just revoke it and generate another.
+
+  You'll also need the **Apple ID email** the calendars belong to — the
+  primary email of that Apple Account, not an alias.
+
+- [ ] **Seed the iCloud credential**: with `az login` completed, run
+  locally, once:
+
+  ```bash
+  ICLOUD_KEY_VAULT_NAME=<vault-name> go run ./cmd/seed-credentials
+  ```
+
+  It prompts for the Apple ID email, then the app-specific password
+  (typed into the prompt, not echoed and never a command-line argument, so
+  it stays out of shell history). It writes both, as one JSON secret named
+  `icloud-credentials`, to the vault, and prints `Saved.` on success.
+
+  This runs as *your own* signed-in identity, which needs the `Key Vault
+  Secrets Officer` role from the previous step. It's the only thing that
+  ever writes the secret — the deployed Function App only reads it (see
+  the Managed Identity step in Part 2).
+
+  Seeding does **not** check the password against iCloud — a typo is only
+  caught by the smoke test below, as an iCloud authentication error. To
+  confirm the secret exists without printing its value:
+
+  ```bash
+  az keyvault secret show --vault-name <vault-name> --name icloud-credentials \
+    --query "{name:name, updated:attributes.updated}"
+  ```
+
+  To rotate later: generate a new app-specific password, re-run the same
+  command (it overwrites the secret), then revoke the old password at
+  account.apple.com. No redeploy needed — the running server re-reads the
+  vault the next time iCloud rejects its cached credential.
 
 - [ ] **Local `func start` smoke test, against the real vault, before
   deploying**: install [Azure Functions Core
   Tools](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local)
   and [Azurite](https://learn.microsoft.com/en-us/azure/storage/common/storage-install-azurite)
-  if not already present. Fill in the real vault name in
-  `local.settings.json`, build the binary (`go build -o ios-mcp-server
+  if not already present. Create `local.settings.json` in the project root
+  — it's gitignored, so a fresh clone doesn't have one; copy the template
+  from the README's [Local development](../README.md#local-development)
+  section — and fill in the real vault name and your calendar allowlist
+  (exact display names, as shown in the Calendar app). Build the binary (`go build -o ios-mcp-server
   ./cmd/server`), start Azurite, then run `func start` from the project
   root. Confirm `list_calendars` and `list_events` work end-to-end (a real
   CalDAV call through the Key Vault-backed credential) via any MCP client.
@@ -79,14 +153,31 @@ runs in Azure is exactly what you tested locally.
   ```
 
 - [ ] **Grant the Function App's Managed Identity read-only Key Vault
-  access**: enable a system-assigned Managed Identity (`az functionapp
-  identity assign --name <function-app-name> --resource-group <rg>`), then
-  grant it `Key Vault Secrets User` (read secret contents only) scoped to
-  the vault:
+  access**: reuse the user-assigned identity the wizard created in Part 1
+  (`<app>-uami`) — don't add a system-assigned one as well. From the
+  identity's Overview page, note its **Client ID** and **Object
+  (principal) ID**.
+
+  Point `DefaultAzureCredential` at it. Without `AZURE_CLIENT_ID`, the
+  Azure SDK asks App Service for the *system-assigned* identity, which
+  doesn't exist, and every Key Vault read fails:
+
+  ```bash
+  az functionapp config appsettings set --name <function-app-name> --resource-group <rg> \
+    --settings "AZURE_CLIENT_ID=<uami-client-id>"
+  ```
+
+  Set this only on the Function App, never in `local.settings.json` —
+  locally, `DefaultAzureCredential` should keep resolving to your `az
+  login` session.
+
+  Then grant the identity `Key Vault Secrets User` (read secret contents
+  only) scoped to the vault — `--assignee` takes the principal ID, not the
+  client ID:
 
   ```bash
   az role assignment create --role "Key Vault Secrets User" \
-    --assignee <managed-identity-principal-id> --scope <vault-resource-id>
+    --assignee <uami-principal-id> --scope <vault-resource-id>
   ```
 
   The server only ever reads the credential secret; writing it is done
@@ -102,7 +193,7 @@ runs in Azure is exactly what you tested locally.
 
 - [ ] **Start adding the custom connector in Claude** (web: Settings →
   Connectors → Add custom connector) with your Function App's URL
-  (`https://<function-app-name>.azurewebsites.net/mcp`) — expect Dynamic
+  (`https://<default-hostname>/mcp`) — expect Dynamic
   Client Registration to fail ("Couldn't register with [server]'s sign-in
   service," offering "add an OAuth Client ID" as a fallback). That's
   expected; don't finish the connector yet.
@@ -122,7 +213,7 @@ runs in Azure is exactly what you tested locally.
   2. Add a TXT record at `asuid.<subdomain>` with the Function App's domain
      ownership token (`az resource show --ids <site-id> --query
      properties.customDomainVerificationId`).
-  3. CNAME `<subdomain>` → `<app>.azurewebsites.net`.
+  3. CNAME `<subdomain>` → `<default-hostname>`.
   4. `az functionapp config hostname add --name <app> -g <rg> --hostname
      <subdomain>` once DNS resolves from a public resolver.
   5. `az functionapp config ssl create` + `ssl bind` for a free managed

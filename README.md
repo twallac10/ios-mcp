@@ -162,6 +162,7 @@ reads locally:
 | `ICLOUD_KEY_VAULT_NAME` | yes | — | Key Vault holding the `icloud-credentials` secret. |
 | `ICLOUD_CALENDAR_ALLOWLIST` | yes (empty = nothing exposed) | — | Comma-separated exact calendar display names. |
 | `ICLOUD_DEFAULT_TIMEZONE` | no | `America/Chicago` | IANA zone used for all-day events and any date without an explicit offset. |
+| `AZURE_CLIENT_ID` | in Azure only | — | Client ID of the Function App's user-assigned managed identity, so `DefaultAzureCredential` uses it for Key Vault. Leave unset locally. |
 
 ## One-time iCloud login
 
@@ -177,7 +178,8 @@ deployed Function App's Managed Identity gets read-only `Key Vault Secrets
 User`). Re-run this any time you revoke/rotate the
 app-specific password — the server picks up the new value on its next
 credential load, retrying once automatically if iCloud rejects a cached
-one.
+one. Step-by-step (generating the password, the vault role you need, and
+checking the secret landed): [runbook Part 1](docs/runbook.md#part-1-base-resources).
 
 ## Deploying to Azure
 
