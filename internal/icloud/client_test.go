@@ -153,15 +153,17 @@ func TestFetchObjects_RequestsFullCalendarData(t *testing.T) {
 		t.Fatalf("FetchObjects: %v", err)
 	}
 
-	// The calendar-data request must name VCALENDAR and ask for all of its
-	// properties and subcomponents, not an anonymous, empty <comp>.
-	for _, want := range []string{`name="VCALENDAR"`, "allprop", "allcomp", `name="VEVENT"`, "time-range"} {
+	// The calendar-data request must be bare: iCloud ignores <C:allprop/>
+	// inside a <C:comp>, returning events with every property stripped.
+	for _, want := range []string{"<c:calendar-data/>", `name="VEVENT"`, `start="20261117T060000Z"`, `end="20261118T060000Z"`} {
 		if !strings.Contains(fake.reportBody, want) {
 			t.Errorf("REPORT body missing %q:\n%s", want, fake.reportBody)
 		}
 	}
-	if strings.Contains(fake.reportBody, `name=""`) {
-		t.Errorf("REPORT body contains an unnamed comp:\n%s", fake.reportBody)
+	for _, unwanted := range []string{"<c:comp ", "allprop", "allcomp"} {
+		if strings.Contains(fake.reportBody, unwanted) {
+			t.Errorf("REPORT body contains %q, which iCloud mishandles:\n%s", unwanted, fake.reportBody)
+		}
 	}
 
 	if len(objs) != 1 || objs[0].Path != "/cals/home/fetched.ics" || objs[0].Data == nil {
